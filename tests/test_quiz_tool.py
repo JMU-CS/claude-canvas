@@ -183,5 +183,24 @@ fake = FakeCanvas(copy.deepcopy(TF_LIVE), STALE)
 code, out, err = run_edit(fake, {"points_possible": 2}, dry=True)
 check("dry run sends nothing", code == 0 and not fake.puts and f"--expect {qt.fingerprint(TF_LIVE)}" in out, out)
 
+# 10. Formula questions: evaluator and answer-set generation.
+check("formula arithmetic", qt.evaluate_formulas(["n*(n-1)/2"], {"n": 10}) == 45)
+check("formula power and functions", abs(qt.evaluate_formulas(["2^k + sqrt(x) + log(100) + ln(e)"], {"k": 3, "x": 16}) - 15) < 1e-9)
+check("formula intermediate lines", qt.evaluate_formulas(["m = a + b", "m * 2"], {"a": 1, "b": 2}) == 6)
+try:
+    qt.evaluate_formula("__import__('os').system('true')", {}); ok = False
+except ValueError:
+    ok = True
+check("formula evaluator refuses arbitrary code", ok)
+calc = {"question_type": "calculated_question", "question_text": "<p>[n] items</p>",
+        "formulas": [{"formula": "n*n"}], "variables": [{"name": "n", "min": 2, "max": 9, "scale": 0}],
+        "formula_decimal_places": 0, "answer_count": 5}
+qt.prepare(calc)
+check("answer sets generated", len(calc["answers"]) == 5 and all(
+    a["answer_text"] == int(a["variables"][0]["value"]) ** 2 for a in calc["answers"]), calc["answers"])
+check("calculated payload valid", qt.validate(calc, 0) == [], qt.validate(calc, 0))
+params = dict(qt.encode_question(calc))
+check("nested encoding", "question[formulas][0]" in params and "question[answers][0][variables][0][value]" in params, list(params)[:8])
+
 print("\nfailures:", failures)
 sys.exit(failures)

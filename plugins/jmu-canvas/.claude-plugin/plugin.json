@@ -1,7 +1,7 @@
 {
   "name": "jmu-canvas",
   "description": "Edit Canvas Classic Quiz questions and make reviewed, reversible changes to course structure (modules, pages, files, assignments, dates) from a conversation. Never reads student data; a hook blocks student-data API calls.",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "author": {
     "name": "Nathan Sprague"
   },

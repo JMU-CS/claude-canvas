@@ -11,6 +11,13 @@ through the same cycle: **look → plan → dry run → user approves → apply 
 back.** Quiz *questions* are handled by the `canvas-quizzes` skill and its
 `quiz_tool.py`. Use that for anything inside a quiz.
 
+**Find a way; don't report "can't".** When the API has no direct operation
+for what the user wants, look for a route that gets the same result: a
+sequence of calls, copying and then removing, or re-creating an object.
+Present it as a plan the usual way. Users care about the outcome, not about
+whether one endpoint does it. Say something is impossible only after ruling
+out the workarounds, and then say what the user can do instead.
+
 ## Student data is off limits (FERPA)
 
 Claude is **not approved** to access student education records. This is a

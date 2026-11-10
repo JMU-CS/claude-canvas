@@ -18,10 +18,13 @@ items behind a separate /api/quiz/v1/ Items API that canvasapi does not wrap.
 
 import argparse
 import datetime
+import ast
 import hashlib
 import html as html_module
 import json
+import math
 import pathlib
+import random
 import re
 import sys
 import time
@@ -39,6 +42,7 @@ from canvas_course import CANVAS_URL, LOCAL_TZ, parse_when, show_when  # noqa: E
 #   matching   - answers are {answer_match_left, answer_match_right}
 #   numerical  - answers carry numerical_answer_type and its numeric fields
 #   free       - hand-graded or ungraded; answers optional
+#   calculated - formulas + variable ranges + generated answer sets
 ANSWER_STYLE = {
     "multiple_choice_question": "weighted",
     "true_false_question": "weighted",
@@ -51,7 +55,7 @@ ANSWER_STYLE = {
     "essay_question": "free",
     "file_upload_question": "free",
     "text_only_question": "none",
-    "calculated_question": "free",
+    "calculated_question": "calculated",
 }
 
 # Types actually exercised against Canvas. The rest are built from the API
@@ -62,17 +66,13 @@ TESTED_TYPES = {
     "short_answer_question", "fill_in_multiple_blanks_question",
     "multiple_dropdowns_question", "essay_question", "text_only_question",
     "matching_question", "numerical_question", "file_upload_question",
+    "calculated_question",
 }
 
-# calculated_question needs variables/formulas/answer_tolerance/
-# formula_decimal_places, none of which the create/update endpoint documents as
-# writable. Reading one works; building one through the API probably does not.
-UNSUPPORTED_TYPES = {
-    "calculated_question": "Canvas does not document variables/formulas as "
-                           "writable fields, so a formula question almost "
-                           "certainly cannot be built through the API. "
-                           "Create it in the web UI instead.",
-}
+# Types the tool refuses to build. Empty: calculated_question used to be here,
+# but Canvas does read formulas/variables on write (canvas-lms
+# AnswerParsers::Calculated); the tool generates the answer sets itself.
+UNSUPPORTED_TYPES = {}
 
 # ---------------------------------------------------------------------------
 # Answer field names
@@ -144,6 +144,8 @@ def canonical_answer(answer, qtype, dropped):
     `dropped` so a typo is reported rather than silently ignored.
     """
     style = ANSWER_STYLE.get(qtype)
+    if style == "calculated":
+        return canonical_calculated_answer(answer, dropped)
     out = {}
     # Write names win over read names if a payload carries both.
     for key in sorted(answer, key=lambda k: k in ANSWER_READ_TO_WRITE):
@@ -184,15 +186,171 @@ def canonical_answer(answer, qtype, dropped):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Calculated (formula) questions
+#
+# Canvas grades a calculated question against stored answer SETS: each set is
+# one choice of variable values plus the correct answer for it, and each
+# student gets one set. Canvas does not evaluate the formula when grading, and
+# the API does not generate sets, so the tool picks values in each variable's
+# range and computes the answers itself. The formula text is stored for the
+# web editor; if someone later clicks "Generate" there, Canvas recomputes the
+# sets with its own evaluator.
+# ---------------------------------------------------------------------------
+
+def _log(x, base=10):
+    return math.log(x, base)
+
+
+FORMULA_FUNCTIONS = {
+    "abs": abs, "sqrt": math.sqrt, "ln": math.log, "log": _log, "exp": math.exp,
+    "sin": math.sin, "cos": math.cos, "tan": math.tan, "asin": math.asin,
+    "acos": math.acos, "atan": math.atan, "ceil": math.ceil,
+    "floor": math.floor, "round": round, "min": min, "max": max,
+    "fact": math.factorial, "comb": math.comb, "perm": math.perm,
+}
+FORMULA_CONSTANTS = {"pi": math.pi, "e": math.e}
+
+
+def evaluate_formula(expr, env):
+    """Evaluate one Canvas formula (arithmetic, ^ for powers, the functions
+    above) with variables from env. A restricted evaluator, not eval()."""
+    try:
+        tree = ast.parse(expr.strip().replace("^", "**"), mode="eval")
+    except SyntaxError as e:
+        raise ValueError(f"unsupported syntax in formula '{expr.strip()}': {e.msg}")
+    ops = {ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b,
+           ast.Mult: lambda a, b: a * b, ast.Div: lambda a, b: a / b,
+           ast.Pow: lambda a, b: a ** b, ast.Mod: lambda a, b: a % b}
+
+    def ev(node):
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in ops:
+            return ops[type(node.op)](ev(node.left), ev(node.right))
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            value = ev(node.operand)
+            return -value if isinstance(node.op, ast.USub) else value
+        if isinstance(node, ast.Name):
+            if node.id in env:
+                return env[node.id]
+            if node.id in FORMULA_CONSTANTS:
+                return FORMULA_CONSTANTS[node.id]
+            raise ValueError(f"unknown variable '{node.id}'")
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in FORMULA_FUNCTIONS and not node.keywords):
+            return FORMULA_FUNCTIONS[node.func.id](*[ev(a) for a in node.args])
+        raise ValueError(f"unsupported syntax in formula: {ast.unparse(node)}")
+    return ev(tree)
+
+
+def evaluate_formulas(formulas, env):
+    """Canvas formula lines: 'name = expr' lines define intermediate values;
+    the last line's value is the answer."""
+    env = dict(env)
+    value = None
+    for line in formulas:
+        target, sep, expr = line.partition("=")
+        if sep and re.fullmatch(r"\s*[A-Za-z_]\w*\s*", target) and not expr.startswith("="):
+            value = env[target.strip()] = evaluate_formula(expr, env)
+        else:
+            value = evaluate_formula(line, env)
+    return value
+
+
+def normalize_calculated(question):
+    """Formulas as plain strings and variables as {name,min,max,scale}, from
+    either the read shape ([{"formula": ...}]) or the write shape."""
+    if "formulas" in question:
+        formulas = question["formulas"] or []
+        if isinstance(formulas, str):
+            formulas = [formulas]
+        question["formulas"] = [f["formula"] if isinstance(f, dict) else str(f)
+                                for f in formulas]
+    if "variables" in question:
+        question["variables"] = [
+            {"name": v.get("name"), "min": v.get("min"), "max": v.get("max"),
+             "scale": int(v.get("scale") or 0)}
+            for v in (question["variables"] or [])]
+
+
+def canonical_calculated_answer(answer, dropped):
+    """An answer set in write form: answer_text plus [{name, value}]."""
+    out = {}
+    value = answer.get("answer_text", answer.get("answer"))
+    if value is not None:
+        out["answer_text"] = value
+    variables = answer.get("variables") or []
+    if isinstance(variables, dict):            # {"x": 3} shorthand
+        variables = [{"name": k, "value": v} for k, v in variables.items()]
+    out["variables"] = [{"name": v.get("name"), "value": v.get("value")}
+                        for v in variables]
+    if answer.get("id") is not None:
+        out["id"] = answer["id"]
+    for key in answer:
+        if key not in ("answer_text", "answer", "variables", "id", "weight"):
+            dropped.add(key)
+    return out
+
+
+def generate_answer_sets(question, where="question"):
+    """Fill question["answers"] with answer_count random answer sets."""
+    count = int(question.pop("answer_count", None) or 10)
+    formulas = question.get("formulas") or []
+    variables = question.get("variables") or []
+    places = int(question.get("formula_decimal_places") or 0)
+    if not formulas or not variables:
+        return                     # validate() reports what is missing
+    rng = random.Random()
+    sets, seen, attempts = [], set(), 0
+    while len(sets) < count and attempts < count * 50:
+        attempts += 1
+        env = {}
+        for v in variables:
+            lo, hi, scale = float(v["min"]), float(v["max"]), int(v.get("scale") or 0)
+            env[v["name"]] = (rng.randint(math.ceil(lo), math.floor(hi)) if scale == 0
+                              else round(rng.uniform(lo, hi), scale))
+        key = tuple(sorted(env.items()))
+        if key in seen:
+            continue
+        try:
+            value = evaluate_formulas(formulas, env)
+        except (ZeroDivisionError, ValueError, OverflowError) as e:
+            if "unsupported" in str(e) or "unknown variable" in str(e):
+                die(f"{where}: {e}")
+            continue
+        seen.add(key)
+        answer = round(float(value), places)
+        sets.append({
+            "answer_text": int(answer) if places == 0 else answer,
+            "variables": [{"name": v["name"],
+                           "value": (f"{env[v['name']]:.{int(v.get('scale') or 0)}f}")}
+                          for v in variables]})
+    if len(sets) < count:
+        print(f"note: {where}: only {len(sets)} distinct answer set(s) fit the "
+              "variable ranges", file=sys.stderr)
+    question["answers"] = sets
+
+
 def prepare(question, where="question"):
     """Rewrite a payload to the names Canvas reads, in place, and return it.
 
     Read-only fields that appear in a `questions --json` dump are dropped so a
-    dump can be edited and sent back as-is.
+    dump can be edited and sent back as-is. For calculated questions, answer
+    sets are generated here when the payload has none (or has answer_count).
     """
     for key in READ_ONLY_FIELDS:
         question.pop(key, None)
     question.pop("_fingerprint", None)
+    if question.get("question_type") == "calculated_question":
+        normalize_calculated(question)
+        if not question.get("answers") or "answer_count" in question:
+            generate_answer_sets(question, where)
+    else:
+        for key in CALCULATED_FIELDS + ("answer_count",):
+            question.pop(key, None)
     if "answers" in question:
         dropped = set()
         question["answers"] = [canonical_answer(a, question.get("question_type"),
@@ -213,14 +371,16 @@ WRITABLE_FIELDS = {
     "neutral_comments", "correct_comments_html", "incorrect_comments_html",
     "neutral_comments_html", "text_after_answers", "answers", "quiz_group_id",
     "matching_answer_incorrect_matches",
+    "formulas", "variables", "answer_tolerance", "formula_decimal_places",
 }
+CALCULATED_FIELDS = ("formulas", "variables", "answer_tolerance",
+                     "formula_decimal_places")
 
 # Fields a `questions --json` dump carries that cannot be written. They are
 # dropped from payloads rather than rejected, so a dump round-trips.
 # position is listed as writable in the API docs but Canvas ignores it.
 READ_ONLY_FIELDS = {
     "id", "quiz_id", "position", "course_id", "assessment_question_id", "name", "matches",
-    "variables", "formulas", "answer_tolerance", "formula_decimal_places",
 }
 
 # The text fields sent with every edit. Canvas fills any field that is missing
@@ -366,6 +526,9 @@ def validate(question, index):
     if style == "free":
         return problems
 
+    if style == "calculated":
+        return problems + validate_calculated(question, where)
+
     if not answers:
         problems.append(f"{where}: {qtype} requires answers")
         return problems
@@ -471,6 +634,41 @@ def validate(question, index):
     return problems
 
 
+def validate_calculated(question, where):
+    problems = []
+    formulas = question.get("formulas") or []
+    variables = question.get("variables") or []
+    answers = question.get("answers") or []
+    if not formulas:
+        problems.append(f"{where}: calculated_question needs 'formulas' "
+                        "(a list of formula strings; the last one is the answer)")
+    if not variables:
+        problems.append(f"{where}: calculated_question needs 'variables' "
+                        "([{name, min, max, scale}])")
+    names = []
+    for j, v in enumerate(variables):
+        if not v.get("name") or v.get("min") is None or v.get("max") is None:
+            problems.append(f"{where}.variables[{j}]: needs name, min and max")
+            continue
+        names.append(v["name"])
+        if float(v["min"]) > float(v["max"]):
+            problems.append(f"{where}.variables[{j}]: min is greater than max")
+        if f"[{v['name']}]" not in (question.get("question_text") or ""):
+            problems.append(f"{where}: variable [{v['name']}] does not appear in "
+                            "the question text, so students would never see its value")
+    if not answers:
+        problems.append(f"{where}: no answer sets (they are generated from the "
+                        "formula; check the variable ranges)")
+    for j, a in enumerate(answers):
+        if a.get("answer_text") is None:
+            problems.append(f"{where}.answers[{j}]: missing the answer value")
+        got = sorted(v.get("name") for v in a.get("variables") or [])
+        if got != sorted(names):
+            problems.append(f"{where}.answers[{j}]: variable values {got} do not "
+                            f"match the variables {sorted(names)}")
+    return problems
+
+
 def image_tag(canvas_url, course_id, file_id, alt, width=None):
     """The <img> markup Canvas's own editor produces for a course file.
 
@@ -569,6 +767,12 @@ def full_question(live):
     if ANSWER_STYLE.get(qtype) == "matching":
         q["matching_answer_incorrect_matches"] = (
             live.get("matching_answer_incorrect_matches") or "")
+    if ANSWER_STYLE.get(qtype) == "calculated":
+        for field in CALCULATED_FIELDS:
+            q[field] = live.get(field)
+        q["answer_tolerance"] = q["answer_tolerance"] or 0
+        q["formula_decimal_places"] = q["formula_decimal_places"] or 0
+        normalize_calculated(q)
     q["answers"] = [canonical_answer(a, qtype, set())
                     for a in (live.get("answers") or [])]
     return q
@@ -600,15 +804,23 @@ def encode_question(q):
     Canvas treats null as missing and fills it from the stored copy.
     """
     params = []
+
+    def flatten(prefix, value):
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for k, v in value.items():
+                flatten(f"{prefix}[{k}]", v)
+        elif isinstance(value, list):
+            for i, v in enumerate(value):
+                flatten(f"{prefix}[{i}]", v)
+        else:
+            params.append((prefix, send_value(value)))
+
     for key in sorted(q):
-        if key in ("answers", "position") or q[key] is None:
+        if key == "position":
             continue
-        params.append((f"question[{key}]", send_value(q[key])))
-    for i, answer in enumerate(q.get("answers") or []):
-        for key, value in answer.items():
-            if value is None:
-                continue
-            params.append((f"question[answers][{i}][{key}]", send_value(value)))
+        flatten(f"question[{key}]", q[key])
     return params
 
 
@@ -691,6 +903,8 @@ def differences(intended, actual):
     got = actual.get("answers") or []
     if ANSWER_STYLE.get(qtype) in ("none", "free") and not want:
         return diffs
+    if ANSWER_STYLE.get(qtype) == "calculated":
+        return diffs + calculated_differences(intended, actual, check, short)
     if len(want) != len(got):
         diffs.append(f"answers: sent {len(want)}, Canvas has {len(got)}")
         return diffs
@@ -709,6 +923,39 @@ def differences(intended, actual):
             else:
                 how = lambda a, b: plain(a) == plain(b)
             check(f"answers[{i}].{read_key}", value, g.get(read_key), how)
+    return diffs
+
+
+def calculated_differences(intended, actual, check, short):
+    diffs = []
+    got = dict(actual)
+    normalize_calculated(got)
+    if [plain(f) for f in intended.get("formulas") or []] != \
+            [plain(f) for f in got.get("formulas") or []]:
+        diffs.append(f"formulas: sent {intended.get('formulas')}, "
+                     f"Canvas has {got.get('formulas')}")
+    for field in ("answer_tolerance", "formula_decimal_places"):
+        check(field, intended.get(field), actual.get(field), close)
+    want_vars = intended.get("variables") or []
+    got_vars = got.get("variables") or []
+    if len(want_vars) != len(got_vars) or any(
+            w["name"] != g["name"] or not close(w["min"], g["min"])
+            or not close(w["max"], g["max"]) or int(w["scale"]) != int(g["scale"])
+            for w, g in zip(want_vars, got_vars)):
+        diffs.append(f"variables: sent {want_vars}, Canvas has {got_vars}")
+    want = intended.get("answers") or []
+    have = actual.get("answers") or []
+    if len(want) != len(have):
+        diffs.append(f"answer sets: sent {len(want)}, Canvas has {len(have)}")
+        return diffs
+    for i, (w, g) in enumerate(zip(want, have)):
+        if not close(w.get("answer_text"), g.get("answer")):
+            diffs.append(f"answers[{i}]: sent {w.get('answer_text')}, "
+                         f"Canvas has {g.get('answer')}")
+        wv = {v["name"]: v["value"] for v in w.get("variables") or []}
+        gv = {v.get("name"): v.get("value") for v in g.get("variables") or []}
+        if set(wv) != set(gv) or any(not close(wv[k], gv[k]) for k in wv):
+            diffs.append(f"answers[{i}].variables: sent {wv}, Canvas has {gv}")
     return diffs
 
 
@@ -762,56 +1009,55 @@ def cmd_quizzes(course, args):
               f"{'Y' if getattr(q, 'published', False) else 'N':>4}  {q.title}")
 
 
-def display_order(questions):
+def display_order(quiz, questions):
     """Questions in the order Canvas shows them, with Canvas's own numbering.
 
     Canvas does not number text_only_question items, so its "Question 7" is
-    not the 7th item on the quiz. That part is confirmed: a quiz with 14 items
-    including one text-only reports question_count 13.
+    not the 7th item on the quiz (confirmed: 14 items including one text-only
+    report question_count 13). A group that picks k questions takes k numbers
+    on the student's view; which members fill them is random, so members are
+    listed under the group's range of numbers.
 
-    Order is the order the questions endpoint returns, which is by id. Do NOT
-    re-sort by position: editing a question nulls its position while leaving
-    it displayed in place, so sorting nulls to the end invents a reordering
-    that Canvas is not doing. Verified on a live quiz, where two edited
-    questions have null positions and still render in their original slots.
+    Order comes from root_entries(): the questions endpoint and the quiz page
+    both sort by the database `position` column. The `position` field in each
+    question's JSON is NOT that column -- it is a copy inside the stored
+    question data, usually null -- so never sort by it.
 
-    Returns a list of (canvas_number_or_None, question) and a flag saying
-    whether any non-null positions contradict this order.
+    Returns a list of (label, question, group_or_None).
     """
     rows, n = [], 0
-    for q in questions:
-        if q.question_type == "text_only_question":
-            rows.append((None, q))          # Canvas shows these unnumbered
+    for e in root_entries(quiz, questions):
+        if e["kind"] == "question":
+            q = e["question"]
+            if q.question_type == "text_only_question":
+                rows.append(("--", q, None))
+            else:
+                n += 1
+                rows.append((f"Q{n}", q, None))
         else:
-            n += 1
-            rows.append((n, q))
-
-    # If the questions that do carry positions are not in increasing order,
-    # the id order and Canvas's order may genuinely disagree.
-    known = [q.position for q in questions if q.position is not None]
-    consistent = known == sorted(known)
-    return rows, consistent
+            k = int(e["group"].get("pick_count") or 0)
+            span = (f"Q{n + 1}" + (f"-{n + k}" if k > 1 else "")) if k else "--"
+            n += k
+            for q in e["members"]:
+                rows.append((span, q, e["group"]))
+    return rows
 
 
 def cmd_questions(course, args):
     quiz = course.get_quiz(args.quiz_id)
     questions = list(quiz.get_questions())
-    rows, consistent = display_order(questions)
+    rows = display_order(quiz, questions)
     taken = has_student_submissions(quiz)
     print(f"{quiz.title}  (id {quiz.id}, {len(questions)} items, "
           f"{getattr(quiz, 'points_possible', '?')} pts, "
           f"{'published' if quiz.published else 'unpublished'}, "
           f"{'HAS student submissions' if taken else 'no student submissions'})")
 
-    if not consistent:
-        print("\n  !! stored positions are out of order relative to the order "
-              "this endpoint returns;")
-        print("  !! the Q# below may not match Canvas. Verify in the web UI.")
     print()
 
     if args.json:
         payload = []
-        for _, q in rows:
+        for _, q, _ in rows:
             d = {k: v for k, v in q.__dict__.items() if not k.startswith("_")}
             # Keep this in an edited dump: `edit` uses it to refuse a write
             # if someone else changed the question in the meantime.
@@ -820,13 +1066,19 @@ def cmd_questions(course, args):
         print(json.dumps(payload, indent=2, default=str))
         return
 
-    print("  Q#   is the number Canvas shows; text-only items are unnumbered.")
-    print(f"  {'Q#':>4}  {'id':>10}  {'pos':>4}  type / points / name")
-    for number, q in rows:
-        label = f"Q{number}" if number else "--"
-        print(f"  {label:>4}  {q.id:>10}  {str(q.position):>4}  "
-              f"{q.question_type}  {q.points_possible} pt  {q.question_name!r}")
-        print(f"        {summarize(q)}")
+    print("  Q#   is the number Canvas shows students; text-only items are unnumbered.")
+    print(f"  {'Q#':>6}  {'id':>10}  type / points / name")
+    shown_groups = set()
+    for label, q, group in rows:
+        if group and group["id"] not in shown_groups:
+            shown_groups.add(group["id"])
+            print(f"  {label:>6}  {'g' + str(group['id']):>10}  GROUP {group.get('name')!r}: "
+                  f"students get {group.get('pick_count')} of these, "
+                  f"{group.get('question_points')} pt each")
+        indent = "    " if group else ""
+        print(f"  {'' if group else label:>6}  {q.id:>10}  {indent}{q.question_type}  "
+              f"{q.points_possible} pt  {q.question_name!r}")
+        print(f"          {indent}{summarize(q)}")
 
 
 def cmd_add(course, args):
@@ -853,10 +1105,8 @@ def cmd_add(course, args):
     quiz = course.get_quiz(args.quiz_id)
     check_writable(quiz, args.force)
 
-    # Questions created through the API come back with position == null, and
-    # Canvas ignores a position sent on create (the /reorder endpoint returns
-    # 204 but changes nothing). New questions land at the end, in the order
-    # they are sent. Reordering has to be done by dragging in the web UI.
+    # New questions land at the end, in the order they are sent. Use the
+    # reorder subcommand afterwards to put them anywhere else.
     print(f"Adding {len(questions)} question(s) to '{quiz.title}' (id {quiz.id})")
     if args.dry_run:
         print("*** DRY RUN: nothing will be created ***")
@@ -1167,6 +1417,15 @@ def cmd_edit(course, args):
         if field in changes and f"{field}_html" not in changes:
             merged[f"{field}_html"] = ""
     merged.update({k: v for k, v in changes.items() if k != "_fingerprint"})
+    # A formula question's answer sets were computed from its formula and
+    # variable ranges; if those change, the old sets are wrong. Regenerate
+    # the same number unless the edit supplies its own.
+    if (merged.get("question_type") == "calculated_question"
+            and any(k in changes for k in ("formulas", "variables",
+                                           "formula_decimal_places"))
+            and "answers" not in changes):
+        merged.setdefault("answer_count", len(base.get("answers") or []) or 10)
+        merged.pop("answers", None)
     for field in TEXT_FIELDS:
         if merged.get(field) is None:
             merged[field] = ""
@@ -1248,6 +1507,118 @@ def cmd_edit(course, args):
     resave(quiz)
 
 
+def post_json(quiz, path, body):
+    """POST a JSON body (canvasapi only sends form data outside GraphQL)."""
+    req = quiz._requester
+    response = req._session.post(
+        f"{req.base_url}{path}", json=body,
+        headers={"Authorization": f"Bearer {req.access_token}"})
+    if response.status_code >= 400:
+        raise RuntimeError(f"HTTP {response.status_code}: {response.text[:300]}")
+    return response
+
+
+def quiz_group(quiz, group_id):
+    return quiz._requester.request(
+        "GET", f"courses/{quiz.course_id}/quizzes/{quiz.id}/groups/{group_id}").json()
+
+
+def root_entries(quiz, questions=None):
+    """The quiz's top-level entries in display order.
+
+    Top-level entries are questions outside any group, plus question groups
+    (token g<ID>). Questions inside a group move with their group. Canvas
+    keeps one position sequence for both but only exposes it for groups, so
+    groups are placed among the questions by their position: exact after any
+    reorder (by this tool or the web UI), approximate otherwise.
+
+    Each entry: {"kind", "id", "token", "label", "question" | "group",
+    "members"}.
+    """
+    if questions is None:
+        questions = list(quiz.get_questions())
+    loose = [q for q in questions if not getattr(q, "quiz_group_id", None)]
+    groups = {}
+    for q in questions:
+        gid = getattr(q, "quiz_group_id", None)
+        if gid:
+            groups.setdefault(gid, []).append(q)
+    entries = [{"kind": "question", "id": q.id, "token": str(q.id), "question": q,
+                "label": f"{q.question_type}  {q.question_name!r}  {summarize(q)[:50]}"}
+               for q in loose]
+    info = {gid: quiz_group(quiz, gid) for gid in groups}
+    for gid in sorted(groups, key=lambda g: info[g].get("position") or 0):
+        g = info[gid]
+        entry = {"kind": "group", "id": gid, "token": f"g{gid}", "group": g,
+                 "members": groups[gid],
+                 "label": f"group {g.get('name')!r}: pick {g.get('pick_count')} of "
+                          f"{len(groups[gid])}, {g.get('question_points')} pt each"}
+        index = min(max((g.get("position") or len(entries) + 1) - 1, 0), len(entries))
+        entries.insert(index, entry)
+    return entries
+
+
+def cmd_reorder(course, args):
+    """Put a quiz's questions (and question groups) in a new order."""
+    quiz = course.get_quiz(args.quiz_id)
+    entries = root_entries(quiz)
+    current = [e["token"] for e in entries]
+    labels = {e["token"]: e["label"] for e in entries}
+
+    wanted = [t.strip() for t in args.order.replace(" ", ",").split(",") if t.strip()]
+    missing = [t for t in current if t not in wanted]
+    unknown = [t for t in wanted if t not in labels]
+    dupes = sorted({t for t in wanted if wanted.count(t) > 1})
+    if unknown or missing or dupes:
+        for t in unknown:
+            print(f"error: {t} is not a top-level question or group on this quiz "
+                  "(questions inside a group move with the group; give g<ID>)",
+                  file=sys.stderr)
+        for t in missing:
+            print(f"error: {t} ({labels[t]}) is missing from --order", file=sys.stderr)
+        for t in dupes:
+            print(f"error: {t} appears more than once", file=sys.stderr)
+        print("\nCurrent order:", file=sys.stderr)
+        for pos, token in enumerate(current, 1):
+            print(f"  {pos:>3}. {token:>10}  {labels[token]}", file=sys.stderr)
+        die("--order must list every top-level question and group exactly once; "
+            "nothing was changed")
+
+    print(f"Reordering '{quiz.title}' (quiz {quiz.id})")
+    print(f"  {'now':>4}  {'new':>4}  id")
+    for new_pos, token in enumerate(wanted, 1):
+        old_pos = current.index(token) + 1
+        mark = "" if old_pos == new_pos else "  <-"
+        print(f"  {old_pos:>4}  {new_pos:>4}  {token:>10}  {labels[token]}{mark}")
+    if wanted == current:
+        print("  already in this order; nothing to do")
+        return
+    print("  note: a group drawn from a question bank (no questions of its own) "
+          "is invisible to the API; check its place in the web UI if the quiz has one")
+
+    if args.dry_run:
+        print("*** DRY RUN: nothing was changed ***")
+        return
+    check_writable(quiz, args.force)
+
+    order = [{"type": "group" if t.startswith("g") else "question",
+              "id": int(t.lstrip("g"))} for t in wanted]
+    try:
+        # A JSON body is what works. Form encoding (order[][id]=...) has
+        # returned a 500, or a 204 that changed nothing.
+        post_json(quiz, f"courses/{quiz.course_id}/quizzes/{quiz.id}/reorder",
+                  {"order": order})
+    except Exception as e:
+        die(f"reorder failed: {e}")
+
+    after = [e["token"] for e in root_entries(quiz)]
+    if after != wanted:
+        die("Canvas reports a different order than requested:\n  "
+            + " ".join(after) + "\nCheck the quiz in the web UI.")
+    print("  ✓ reordered and read back: matches")
+    resave(quiz)
+
+
 def cmd_delete(course, args):
     quiz = course.get_quiz(args.quiz_id)
     question = quiz.get_question(args.question_id)
@@ -1286,55 +1657,50 @@ def settle(fetch, expected, attempts=4, delay=0.5):
 
 
 def resave(quiz):
-    """Make Canvas recompute the quiz totals after questions change.
+    """Make a published quiz serve its current questions.
 
-    A published quiz serves a frozen snapshot (quiz_data). Adding or removing
-    questions through the API leaves that snapshot stale: question_count and
-    points_possible stay at their old values and students can be served the
-    old question set. A plain edit does NOT clear it -- only an unpublish /
-    republish cycle does. Verified against Canvas.
+    A published quiz serves a frozen snapshot (quiz_data) that Canvas
+    regenerates only when the quiz's published state changes, or when the
+    quiz is saved in the web UI (canvas-lms Quiz#generate_quiz_data_on_publish
+    and QuizzesController#update). Any question change made through the API --
+    edit, add, delete, reorder -- is invisible to students until then, and
+    question_count / points_possible stay stale. So after a change to a
+    published quiz, unpublish and republish it.
 
-    Unpublishing is refused by Canvas once a quiz has submissions, so in that
-    case say what is wrong instead of trying.
-
-    On an UNPUBLISHED quiz a stale count is cosmetic: nothing is being served.
-    Do not warn about it, or the warning becomes noise that hides the real one.
+    Canvas refuses to unpublish a quiz once students have submitted (including
+    attempts in progress); then the user must open the quiz in Canvas and click
+    Save. On an UNPUBLISHED quiz nothing is being served, so nothing is needed.
     """
     try:
-        quiz.edit(quiz={"notify_of_update": False})
-        questions = list(quiz.get_questions())
-        items = len(questions)
-        # Canvas's question_count excludes text-only items.
-        graded = sum(1 for q in questions
-                     if q.question_type != "text_only_question")
-
         def totals():
             r = quiz._requester.request(
                 "GET", f"courses/{quiz.course_id}/quizzes/{quiz.id}").json()
             return r.get("question_count"), r.get("points_possible"), r.get("published")
 
+        questions = list(quiz.get_questions())
+        # Canvas's question_count excludes text-only items.
+        graded = sum(1 for q in questions
+                     if q.question_type != "text_only_question")
+        count, points, published = totals()
+        if not published:
+            print(f"  quiz now has {len(questions)} item(s); unpublished, so "
+                  "students will see these questions once it is published")
+            return
+        if has_student_submissions(quiz):
+            print("  !! This quiz is published and students have submitted, so "
+                  "Canvas will not let it be unpublished. Students still see the "
+                  "PREVIOUS version of the questions until you open the quiz in "
+                  "Canvas and click Save.")
+            return
+        quiz.edit(quiz={"published": False})
+        quiz.edit(quiz={"published": True, "notify_of_update": False})
         count, points, published = settle(totals, graded)
-
-        if published and count != graded:
-            if has_student_submissions(quiz):
-                print(f"  !! this published quiz still serves {count} question(s) "
-                      f"but has {graded}. Republishing would fix it, but the quiz "
-                      "has student submissions, so Canvas will not let it be "
-                      "unpublished. Open it in Canvas and save it there.")
-            else:
-                quiz.edit(quiz={"published": False})
-                quiz.edit(quiz={"published": True, "notify_of_update": False})
-                count, points, published = settle(totals, graded)
-                print("  (republished to refresh the quiz's cached question list)")
-
-        line = f"  quiz now has {items} item(s), {points} pts"
-        if published and count != graded:
-            line += (f"  !! Canvas still serves {count}; "
-                     "open the quiz in Canvas and save it")
-        print(line)
+        print(f"  republished so students see the change; quiz now has "
+              f"{len(questions)} item(s), {points} pts")
     except Exception as e:
-        print(f"  note: could not refresh quiz totals ({e}); "
-              "open the quiz in Canvas and click Save if counts look stale")
+        print(f"  !! could not republish ({e}). If the quiz is published, open "
+              "it in Canvas and click Save, or students keep seeing the old "
+              "version.")
 
 
 def main():
@@ -1460,6 +1826,14 @@ def main():
                    help="show what would be uploaded without doing it")
     p.set_defaults(func=cmd_upload_image)
 
+    p = sub.add_parser("reorder", help="put questions (and groups) in a new order")
+    p.add_argument("quiz_id", type=int)
+    p.add_argument("--order", required=True,
+                   help="every top-level question id (and g<ID> for a question "
+                        "group) in the new order, comma-separated. `reorder "
+                        "QUIZ_ID --order x --dry-run` lists the current order.")
+    p.set_defaults(func=cmd_reorder)
+
     p = sub.add_parser("delete", help="delete one question")
     p.add_argument("quiz_id", type=int)
     p.add_argument("question_id", type=int)
@@ -1467,7 +1841,7 @@ def main():
     p.set_defaults(func=cmd_delete)
 
     # Flags shared by the mutating subcommands.
-    for name in ("add", "edit", "delete"):
+    for name in ("add", "edit", "delete", "reorder"):
         sp = sub.choices[name]
         sp.add_argument("--dry-run", action="store_true",
                         help="show what would change without sending it to Canvas")

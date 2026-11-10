@@ -37,9 +37,10 @@ those yourself.
 
 - Python 3.9+ and `pip install canvasapi`, in the interpreter Claude Code's
   shell uses
-- A Canvas API token: **Canvas → Account → Settings → New Access Token**
-- Classic Quizzes for the quiz skill. New Quizzes (Quizzes.Next) cannot be
-  edited this way.
+- A Canvas API token. At JMU you can't create one yourself; request one from a
+  Canvas administrator.
+- Classic Quizzes for the quiz tool. For New Quizzes (Quizzes.Next), Claude can
+  script against Canvas's separate New Quizzes API, but that route is untested.
 
 The Canvas host defaults to `https://canvas.jmu.edu` and dates to
 `America/New_York` (`CANVAS_URL` and `LOCAL_TZ` in
@@ -93,9 +94,9 @@ Use the **Marketplaces** tab of `/plugins`, or
 
 ## First run
 
-Your token is a personal secret. Don't paste it into a chat and don't commit
-it. Put it in a file and pass it once; it is cached in your own user data
-directory afterwards.
+Once a Canvas administrator has issued your token, keep it secret: don't paste
+it into a chat and don't commit it. Put it in a file and pass it once; it is
+cached in your own user data directory afterwards.
 
 ```
 echo 'YOUR_TOKEN' > ~/canvas_key.txt && chmod 600 ~/canvas_key.txt
@@ -117,6 +118,8 @@ quiz_tool.py --course-id 12345 find "binary search"
 # build
 quiz_tool.py --course-id 12345 create "Quiz 3" --due "10/9/2026" --time-limit 30
 quiz_tool.py --course-id 12345 add 67890 --file q.json --dry-run
+quiz_tool.py --course-id 12345 edit 67890 111 --file changes.json --dry-run
+quiz_tool.py --course-id 12345 reorder 67890 --order 111,113,g55,112 --dry-run
 quiz_tool.py --course-id 12345 upload-image diagram.png --alt "call stack"
 
 # settings
@@ -158,13 +161,18 @@ and a plan id; re-run it with `--apply PLAN_ID` to make them.
 `--course-id` applies to that run only once a default is saved; add
 `--save-course-id` to change the saved default.
 
-## Limits
+## Notes
 
-- Classic Quizzes only.
-- Question banks cannot be managed, and bank-linked questions are untested.
-- `calculated_question` (formula questions) cannot be created; build those in
-  the Canvas web UI.
-- Question order cannot be changed; drag questions in the Canvas web UI.
+- All 12 Classic Quiz question types work, including formula
+  (`calculated_question`) questions. The tool generates their answer sets from
+  the formula and the variable ranges.
+- `reorder` changes question order, including question groups.
+- After any change to a published quiz, the tool republishes it so students
+  see the change. If students have already submitted, Canvas won't allow
+  that, and the tool asks you to click **Save** on the quiz in Canvas instead.
+- Question banks themselves have no Canvas API. Questions that come from a
+  bank are untested, and a group that draws from a bank is invisible to the
+  API, so check its place in the web UI.
 
 ## Development
 

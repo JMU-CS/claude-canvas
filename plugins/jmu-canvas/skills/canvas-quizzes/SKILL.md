@@ -8,6 +8,13 @@ description: Add, edit, or delete questions on Canvas Classic Quizzes, and chang
 Use the bundled tool. It wraps the Classic Quizzes question API and refuses
 unsafe writes.
 
+**Find a way; don't report "can't".** If the tool has no direct command for
+something the user wants, work out a way to get there and offer it. Options
+include a sequence of existing commands, re-creating questions, or a small
+script using the same helpers. Users care about the result, not whether the
+API offers it in one call. Only say something is impossible after ruling out
+the workarounds, and then say what the user can do instead.
+
 **Scope.** This skill covers quiz questions and quiz settings, and nothing
 else. Having a Canvas token set up for it is **not** license to change
 anything else in the course. For modules, pages, files, assignments,
@@ -38,9 +45,10 @@ project. All examples below abbreviate it as `quiz_tool.py`.
 
 ## First run
 
-The tool needs a Canvas API token, which each person generates themselves at
-**Canvas → Account → Settings → New Access Token**. It is a personal secret:
-never paste one into a chat message or commit it. Pass it once and it is cached
+The tool needs a Canvas API token. At JMU instructors **cannot generate one
+themselves**; it has to be requested from a Canvas administrator. If the user
+has no token yet, tell them that. A token is a
+personal secret: never paste one into a chat message or commit it. Pass it once and it is cached
 in the user's own data directory (`~/.local/share/bulk_canvas_actions/config.ini`
 on Linux, equivalents elsewhere):
 
@@ -58,22 +66,30 @@ Requires Python 3.9+ and `pip install canvasapi`. The Canvas host defaults to
   behind a separate `/api/quiz/v1/` Items API that `canvasapi` does not wrap —
   its `NewQuiz` class has only `delete`, `update`, `set_attributes`, with no
   item access. `quiz_tool.py quizzes` prints a note when it sees New Quizzes
-  in a course; those questions cannot be edited here at all.
+  in a course. quiz_tool does not cover them, but New Quizzes have their own
+  REST Items API (`/api/quiz/v1/courses/:course_id/quizzes/:assignment_id/items`).
+  If the user needs one edited, offer to script against it, and say it is
+  untested here: try it on a sandbox course first, with the same full-write
+  and read-back discipline.
 - **Check which engine the user's course uses before promising anything.**
   Do not assume. The `quizzes` subcommand lists Classic quizzes and flags any
   New Quizzes it finds alongside them.
-- **`position` is not writable, and editing a question nulls it.** Canvas
-  ignores `position` on create and on edit, and `POST .../reorder` returns 500
-  under correct paired encoding (a 204 under malformed encoding is a silent
-  no-op). Editing a question sets its stored `position` to null. This is
-  confirmed in the raw JSON, not a canvasapi artifact.
-- **A null position does NOT change where Canvas displays a question.**
-  Confirmed against a live quiz: two edited questions had null positions and
-  still rendered in their original slots. Canvas's displayed order
-  matches the order the questions endpoint returns (by id). **Do not re-sort
-  by position** — sorting nulls to the end invents a reordering Canvas is not
-  doing. New questions get the highest id, so they land last, which is also
-  where they display.
+- **Questions can be reordered: use `quiz_tool.py reorder`.** It calls
+  `POST .../reorder` with a **JSON body** (`{"order": [{"type": "question",
+  "id": N}, {"type": "group", "id": G}, ...]}`). Form-encoded `order[][id]`
+  returned a 500 or a do-nothing 204, which was once misread as "order is
+  not writable". Verified live 2026-11-10, including a question group.
+- **The `position` field in question JSON is not the display position.** It
+  is a copy inside the stored question data and is usually null. The real
+  position is a database column that the API does not return, but both the
+  questions endpoint and the quiz page sort by it (canvas-lms
+  `QuizQuestionsController#index`, `Quiz#root_entries`). So the endpoint's
+  order is the display order. **Never sort by the JSON `position`.** New
+  questions land at the end; reorder afterwards to put them elsewhere.
+- **Question groups:** `questions` shows each group as a block (`g<ID>`) with
+  its members under it. In `reorder`, a group moves as one entry. A group that
+  draws from a question bank has no questions of its own, so the API cannot
+  see it. Ask the user to check its place in the web UI.
 - **Canvas numbers only non-`text_only` questions.** Confirmed: 14 items with
   one text-only reports `question_count` 13, so Canvas's "Q10" is the 11th
   item. `quiz_tool.py questions` prints Canvas's Q# column — quote that, and
@@ -160,6 +176,20 @@ Workflow for "change question X":
 4. `... add QUIZ_ID --file q.json --dry-run` first.
 5. Show the user the rendered question text and the answer key, then run
    without `--dry-run` on their approval.
+6. If it should not be last, `reorder` it (below).
+
+## Reordering
+
+```bash
+quiz_tool.py --course-id N reorder QUIZ_ID --order x --dry-run   # prints the current order
+quiz_tool.py --course-id N reorder QUIZ_ID --order 901,903,g55,902 --dry-run
+quiz_tool.py --course-id N reorder QUIZ_ID --order 901,903,g55,902
+```
+
+`--order` lists every top-level question id, plus `g<ID>` for each group,
+exactly once. The dry run shows the old and new position of each entry. The
+tool reads the order back after writing and republishes a published quiz
+(see below).
 
 ## Creating quizzes, searching, and settings
 
@@ -212,7 +242,7 @@ matched literally, so do not add backslash escapes.
 
 `answers` uses `weight: 100` for correct, `0` for incorrect.
 
-Canvas Classic Quizzes has **12** question types, all listed below. A survey
+Canvas Classic Quizzes has **12** question types, all supported. A survey
 of 634 real questions found 9 of them in active use; `matching`, `numerical`,
 and `calculated` were absent, so they get less real-world exercise.
 
@@ -229,7 +259,7 @@ and `calculated` were absent, so they get less real-world exercise.
 | `file_upload_question` | none (hand graded) | yes |
 | `matching_question` | `answer_match_left` / `answer_match_right` | yes |
 | `numerical_question` | `numerical_answer_type` + `answer_exact`/`answer_error_margin`, `answer_range_start`/`answer_range_end`, or `answer_approximate`/`answer_precision` | yes |
-| `calculated_question` | **refused** — `variables`/`formulas` are not documented as writable; build it in the web UI | n/a |
+| `calculated_question` | `formulas` + `variables`; the tool generates the answer sets (see below) | yes |
 
 Answers may use either the read names (`text`, `weight`, `html`, `left`,
 `right`, `exact`, `comments`, and so on, as the read API and `questions --json`
@@ -242,15 +272,19 @@ typo shows up.
 
 ### Published quizzes serve a stale snapshot
 
-Adding or removing questions on an **already published** quiz leaves
-`question_count`, `points_possible`, and the served question set at their old
-values. A plain `quiz.edit()` does not clear it. Only unpublish + republish
-does. Verified: a published quiz with 13 added questions reported
-`question_count=0` until republished. `resave()` in quiz_tool.py does this
-automatically when the quiz has no submissions, and tells the user to save it
-in the web UI when it does (Canvas refuses to unpublish a quiz with
-submissions). **This is why adding to a live mid-semester quiz is risky beyond
-the grading risk — students may be served the old question set.**
+Students take a published quiz from a frozen snapshot (`quiz_data`). Canvas
+regenerates it only when the quiz's published state changes, or when someone
+clicks Save in the web UI (canvas-lms `Quiz#generate_quiz_data_on_publish`).
+So **any** question change made through the API (add, edit, delete, reorder)
+is invisible to students until then. `question_count` and `points_possible`
+stay stale as well. Verified: a published quiz with 13 added questions
+reported `question_count=0` until republished.
+
+After every change, `resave()` in quiz_tool.py unpublishes and republishes a
+published quiz. If students have submitted, Canvas refuses to unpublish, so
+the tool tells the user to open the quiz and click **Save**. Relay that
+plainly. Until they do, students see the old version. Unpublished quizzes need
+nothing.
 
 ### File upload questions cannot be tested from Preview
 
@@ -315,6 +349,36 @@ Example (dropdowns, the fiddliest common case):
 
 The validator rejects bad payloads before anything reaches Canvas, so a
 validation error costs nothing — read it and fix the JSON.
+
+### Formula (calculated) questions
+
+Each student gets one **answer set**: one choice of variable values plus the
+correct answer for those values. Canvas grades against the stored sets and
+does not evaluate the formula, and the API will not generate sets. So the
+tool picks values in each variable's range and computes the answers itself:
+
+```json
+{"question_name": "Comparisons", "question_type": "calculated_question",
+ "points_possible": 1,
+ "question_text": "<p>Selection sort on [n] items makes how many comparisons?</p>",
+ "formulas": ["n*(n-1)/2"],
+ "variables": [{"name": "n", "min": 5, "max": 30, "scale": 0}],
+ "answer_tolerance": 0, "formula_decimal_places": 0, "answer_count": 10}
+```
+
+- Every variable must appear in the text as `[name]`. `scale` is the number
+  of decimal places in the generated values (0 means integers).
+- Formulas use `+ - * / ^ %`, parentheses, `pi`, `e`, and `abs sqrt ln log
+  exp sin cos tan asin acos atan ceil floor round min max fact comb perm`.
+  `log(x)` is base 10 and `log(x, b)` takes a base. Earlier lines may define
+  intermediate values (`m = a + b`); the last line is the answer.
+- `answer_tolerance` is how far from the answer a student may be (a number,
+  or a percentage string such as `"1%"`).
+- Editing the formula, the variables, or the decimal places regenerates the
+  sets; editing anything else keeps them. You can also supply `answers`
+  yourself: `[{"variables": {"n": 7}, "answer_text": 21}, ...]`.
+- If someone later clicks Generate in the web editor, Canvas recomputes the
+  sets with its own evaluator. Stick to the syntax above so the two agree.
 
 ## Math notation: LaTeX where it renders, Unicode where it doesn't
 
