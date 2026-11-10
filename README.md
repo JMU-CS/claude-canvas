@@ -16,10 +16,11 @@ The plugin has two skills:
   reads every write back.
 - **canvas-course**: the rest of a course's structure, such as modules, pages,
   files, assignments, dates and publishing. Claude writes a short script for
-  each request using `canvas_course.py`. It shows you every planned change as
-  a dry run, applies only the plan you approved (by its plan id), reads each
-  change back, and keeps a log of the old values in
-  `~/.local/share/bulk_canvas_actions/change_log/` so a change can be undone.
+  each request using `canvas_course.py`. It shows you the list of changes and
+  makes them only after you say yes. If anything changes in the meantime, you
+  see the new list instead. Each change is read back, and the old values are
+  logged in `~/.local/share/bulk_canvas_actions/change_log/` so a change can be
+  undone.
 
 ## Student data (FERPA)
 
@@ -161,7 +162,8 @@ canvas_course.py --course-id 12345 inventory modules     # or assignments, group
 ```
 
 A plan script (see the canvas-course skill for the pattern) prints the changes
-and a plan id; re-run it with `--apply PLAN_ID` to make them.
+it would make. Run it again with `--apply` and it shows them again and asks
+before changing anything.
 
 `--course-id` applies to that run only once a default is saved; add
 `--save-course-id` to change the saved default.

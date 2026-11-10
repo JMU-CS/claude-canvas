@@ -162,7 +162,8 @@ Workflow for "change question X":
 3. `edit QUIZ_ID QUESTION_ID --file q.json --dry-run`. Show the user the
    changes it prints.
 4. On approval, run it without `--dry-run`, plus `--expect` if the payload has
-   no `_fingerprint`. Report the read-back result and do not paraphrase it as
+   no `_fingerprint`. Fingerprints are for you; never show them to the user
+   or ask them to handle one. Report the read-back result and do not paraphrase it as
    success.
 
 ## Workflow for "add a question about X to quiz Y"

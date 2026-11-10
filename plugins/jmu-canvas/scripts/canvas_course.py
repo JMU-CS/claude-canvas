@@ -4,9 +4,11 @@ read-only inventory.
 
 Course setup requests are open-ended (move files, build modules, shift due
 dates, ...), so there is no subcommand per task. Instead, a short script per
-request builds a ChangeSet. Run without --apply it only prints the plan and a
-plan id; run with --apply PLAN_ID it applies exactly that plan, reads each
-value back, and journals the old values so the change can be undone.
+request builds a ChangeSet. Run without --apply it only prints the changes;
+with --apply it asks y/N and then makes them, reads each value back, and
+journals the old values so the change can be undone. (Claude, which cannot
+answer a prompt, passes --apply PLAN_ID instead: that applies only if the
+list is still exactly the one the user approved.)
 
     from canvas_course import connect, ChangeSet, parse_when
 
@@ -20,8 +22,8 @@ value back, and journals the old values so the change can be undone.
                      check=lambda a=a: course.get_assignment(a.id).due_at)
     plan.run()
 
-    python3 week3.py --course-id N                 # dry run: prints plan + id
-    python3 week3.py --course-id N --apply 3f2a9c  # after the user approves
+    python3 week3.py --course-id N           # dry run: prints the changes
+    python3 week3.py --course-id N --apply   # shows them again, asks y/N
 
 Read-only inventory, no script needed:
 
@@ -216,7 +218,11 @@ class ChangeSet:
 
     def run(self, argv=None):
         parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument("--apply", metavar="PLAN_ID")
+        # --apply alone: show the list and ask, in this same run (a person
+        # at a terminal). --apply PLAN_ID: apply without asking, but only if
+        # the list is still the one that was shown (Claude, after the user
+        # said yes to a dry run). The id is plumbing, never shown to users.
+        parser.add_argument("--apply", nargs="?", const="ask", metavar="PLAN_ID")
         known, _ = parser.parse_known_args(argv)
 
         self.show()
@@ -225,13 +231,23 @@ class ChangeSet:
             print("\nNothing to change.")
             return
         if known.apply is None:
-            print(f"\n*** DRY RUN: nothing was changed. Plan id {pid}. ***")
-            print(f"After the user approves this list, re-run with --apply {pid}")
+            print("\n*** DRY RUN: nothing was changed. ***")
+            print("Run again with --apply to make these changes "
+                  f"(non-interactive: --apply {pid}).")
             return
-        if known.apply != pid:
-            sys.exit(f"\nPlan id {known.apply} does not match the current plan "
-                     f"({pid}): the course or the script changed since the "
-                     "dry run. Nothing was changed. Show the user the new list.")
+        if known.apply == "ask":
+            if not sys.stdin.isatty():
+                sys.exit(f"\n--apply needs a terminal to ask for confirmation. "
+                         f"Non-interactively, use --apply {pid} after the list "
+                         "above has been approved.")
+            answer = input(f"\nApply these {len(self.changes)} change(s)? [y/N] ")
+            if answer.strip().lower() not in ("y", "yes"):
+                print("Nothing was changed.")
+                return
+        elif known.apply != pid:
+            sys.exit("\nThe list of changes is different from the one that was "
+                     "approved (the course or the script changed since the dry "
+                     "run). Nothing was changed. Show the user the new list.")
 
         journal_dir = get_datadir() / "bulk_canvas_actions" / "change_log"
         journal_dir.mkdir(parents=True, exist_ok=True)
@@ -243,7 +259,7 @@ class ChangeSet:
         def save():
             journal.write_text(json.dumps(log, indent=2, default=str))
 
-        print(f"\nApplying plan {pid} (journal: {journal})")
+        print(f"\nApplying {len(self.changes)} change(s) (old values logged in {journal})")
         failed = 0
         for i, c in enumerate(self.changes, 1):
             entry = {k: c[k] for k in ("target", "field", "before", "after")}

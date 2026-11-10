@@ -75,13 +75,15 @@ id; check it is the course the user meant before going further.
    asked) that builds a `ChangeSet`: one `add()` per change, each with an
    `apply` callable and, wherever the value can be read back, a `check`
    callable.
-4. **Dry run** (no `--apply`). Show the user **the full list it prints**, not
-   a summary, plus anything you were unsure about.
-5. **Apply only after the user approves that list**, with
-   `--apply PLAN_ID`. Approval covers that plan id only. If anything changes,
-   whether the script, the request, or the course, dry-run again and get
-   approval again. The plan id changes if the list changes, and `--apply`
-   refuses a stale id.
+4. **Dry run** (no `--apply`). Show the user **the full list of changes**,
+   not a summary, plus anything you were unsure about. Leave out the plan id
+   and the command lines.
+5. **Apply only after the user says yes to that list**, by running the script
+   with `--apply PLAN_ID` (the id from the dry run's last line). The id is
+   for you: never show it to the user or ask them to repeat it. Their yes is
+   the approval. It covers that list only. If anything changes (the script,
+   the request, or the course), the id no longer matches and `--apply`
+   refuses. Show the user the new list and ask again.
 6. **Report what the apply printed**, including any ✗ lines, and the journal
    path. Do not paraphrase a partial result as success.
 
