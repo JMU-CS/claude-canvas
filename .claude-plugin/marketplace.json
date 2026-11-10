@@ -1,0 +1,18 @@
+{
+  "name": "jmu-cs",
+  "description": "Claude Code plugins for JMU CS instructors.",
+  "owner": {
+    "name": "JMU CS",
+    "url": "https://github.com/JMU-CS"
+  },
+  "plugins": [
+    {
+      "name": "jmu-canvas",
+      "source": "./plugins/jmu-canvas",
+      "description": "Edit Canvas Classic Quiz questions and course structure conversationally, with dry-run/approve/apply/verify for every change. Works around silent-corruption bugs in the Canvas quiz API and blocks access to student data (FERPA).",
+      "version": "2.0.0",
+      "category": "productivity",
+      "keywords": ["canvas", "lms", "quizzes", "teaching", "jmu"]
+    }
+  ]
+}

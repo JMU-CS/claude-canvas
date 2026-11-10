@@ -1,0 +1,17 @@
+{
+  "description": "FERPA guard: blocks Bash commands (and the scripts they run) that would pull Canvas student data such as submissions, grades, rosters or analytics into the conversation.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/ferpa_guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
