@@ -147,6 +147,11 @@ Run `quiz_tool.py <subcommand> --help` for the full options.
   need `--force`. Nothing notifies students unless you pass `--notify`.
 - Every mutating subcommand takes `--dry-run`.
 - Questions are validated before anything is sent to Canvas.
+- After any change to a published quiz, the tool republishes it so students
+  see the change. If students have already submitted, Canvas won't allow
+  that, and the tool asks you to click **Save** on the quiz in Canvas instead.
+- A question group that draws from a question bank is invisible to the API.
+  If a quiz has one, check its place in Canvas after a `reorder`.
 
 ## Course changes directly
 
@@ -160,19 +165,6 @@ and a plan id; re-run it with `--apply PLAN_ID` to make them.
 
 `--course-id` applies to that run only once a default is saved; add
 `--save-course-id` to change the saved default.
-
-## Notes
-
-- All 12 Classic Quiz question types work, including formula
-  (`calculated_question`) questions. The tool generates their answer sets from
-  the formula and the variable ranges.
-- `reorder` changes question order, including question groups.
-- After any change to a published quiz, the tool republishes it so students
-  see the change. If students have already submitted, Canvas won't allow
-  that, and the tool asks you to click **Save** on the quiz in Canvas instead.
-- Question banks themselves have no Canvas API. Questions that come from a
-  bank are untested, and a group that draws from a bank is invisible to the
-  API, so check its place in the web UI.
 
 ## Development
 

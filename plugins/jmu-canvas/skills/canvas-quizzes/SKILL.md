@@ -242,8 +242,8 @@ matched literally, so do not add backslash escapes.
 
 `answers` uses `weight: 100` for correct, `0` for incorrect.
 
-Canvas Classic Quizzes has **12** question types, all supported. A survey
-of 634 real questions found 9 of them in active use; `matching`, `numerical`,
+Canvas Classic Quizzes has **12** question types. A survey of 634 real
+questions found 9 of them in active use; `matching`, `numerical`,
 and `calculated` were absent, so they get less real-world exercise.
 
 | type | answers | tested? |
