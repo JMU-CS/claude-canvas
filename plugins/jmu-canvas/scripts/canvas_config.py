@@ -5,9 +5,14 @@ Handles command line arguments and config file caching similar to download_text_
 
 import argparse
 import configparser
+import os
 import sys
 import pathlib
 from canvasapi import Canvas
+
+# The one place the Canvas host is set. canvas_course.py and quiz_tool.py
+# import it from here.
+CANVAS_URL = "https://canvas.jmu.edu"
 
 
 def get_datadir() -> pathlib.Path:
@@ -34,26 +39,29 @@ def get_config(config_name="config.ini"):
     if it doesn't already exist.
     """
     config_dir = get_datadir() / "bulk_canvas_actions"
-    try:
-        config_dir.mkdir(parents=True)
-    except FileExistsError:
-        pass
+    config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / config_name
-
     if not config_path.is_file():
-        config_path.touch()
-
+        config_path.touch(mode=0o600)
+    # The config holds the Canvas token, which carries full instructor access
+    # (grades included). Keep it, and the folder, private to the user; this
+    # also tightens files created by earlier versions with default permissions.
+    try:
+        os.chmod(config_dir, 0o700)
+        os.chmod(config_path, 0o600)
+    except OSError:
+        pass   # e.g. Windows, where these modes do not apply
     return config_path
 
 
-def setup_canvas_config(parser=None, require_course_id=True, canvas_url="https://canvas.jmu.edu"):
+def setup_canvas_config(parser=None, require_course_id=True, canvas_url=CANVAS_URL):
     """
     Set up Canvas configuration from command line arguments and/or config file.
     
     Args:
         parser: Optional existing ArgumentParser. If None, creates a new one.
         require_course_id: Whether course ID is required (default True)
-        canvas_url: Canvas instance URL (default https://canvas.jmu.edu)
+        canvas_url: Canvas instance URL (default CANVAS_URL)
     
     Returns:
         tuple: (canvas_api_object, course_id, args)
@@ -137,13 +145,13 @@ def setup_canvas_config(parser=None, require_course_id=True, canvas_url="https:/
     return canvas, course_id, args
 
 
-def get_canvas_and_course(parser=None, canvas_url="https://canvas.jmu.edu"):
+def get_canvas_and_course(parser=None, canvas_url=CANVAS_URL):
     """
     Convenience function that returns Canvas API object and Course object.
     
     Args:
         parser: Optional existing ArgumentParser. If None, creates a new one.
-        canvas_url: Canvas instance URL (default https://canvas.jmu.edu)
+        canvas_url: Canvas instance URL (default CANVAS_URL)
     
     Returns:
         tuple: (canvas_api_object, course_object, args)
@@ -153,13 +161,13 @@ def get_canvas_and_course(parser=None, canvas_url="https://canvas.jmu.edu"):
     return canvas, course, args
 
 
-def setup_canvas_config_gui(canvas_url="https://canvas.jmu.edu"):
+def setup_canvas_config_gui(canvas_url=CANVAS_URL):
     """
     Set up Canvas configuration for GUI applications from config file only.
     Returns None values if configuration is not available.
     
     Args:
-        canvas_url: Canvas instance URL (default https://canvas.jmu.edu)
+        canvas_url: Canvas instance URL (default CANVAS_URL)
     
     Returns:
         tuple: (canvas_api_object, course_id) or (None, None) if config not available

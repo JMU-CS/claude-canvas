@@ -1,9 +1,9 @@
 {
-  "description": "FERPA guard: blocks Bash commands (and the scripts they run) that would pull Canvas student data such as submissions, grades, rosters or analytics into the conversation.",
+  "description": "FERPA guard: blocks Bash commands (and the scripts they run), WebFetch calls, and browser navigation that would pull Canvas student data such as submissions, grades, rosters or analytics into the conversation.",
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|WebFetch|mcp__.*__navigate",
         "hooks": [
           {
             "type": "command",

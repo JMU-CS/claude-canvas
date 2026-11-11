@@ -13,7 +13,18 @@ something the user wants, work out a way to get there and offer it. Options
 include a sequence of existing commands, re-creating questions, or a small
 script using the same helpers. Users care about the result, not whether the
 API offers it in one call. Only say something is impossible after ruling out
-the workarounds, and then say what the user can do instead.
+the workarounds, and then say what the user can do instead. A workaround that
+deletes and re-creates a question or quiz that students have seen or taken is
+not a workaround: it loses their attempts and links. Say exactly what would be
+lost before offering one.
+
+**Every change is approved first.** Each command that writes (`add`, `edit`,
+`delete`, `reorder`, `create`, `settings` with a change, `upload-image`) takes
+`--dry-run`. Run that first, show the user what it prints (for a new or edited
+question, the rendered text and the answer key), and run the real command only
+after they say yes to that output. `delete` asks for confirmation on a
+terminal, which you cannot answer: pass `--yes` only on the run the user
+approved.
 
 **Scope.** This skill covers quiz questions and quiz settings, and nothing
 else. Having a Canvas token set up for it is **not** license to change
@@ -48,17 +59,20 @@ project. All examples below abbreviate it as `quiz_tool.py`.
 The tool needs a Canvas API token. At JMU instructors **cannot generate one
 themselves**; it has to be requested from a Canvas administrator. If the user
 has no token yet, tell them that. A token is a
-personal secret: never paste one into a chat message or commit it. Pass it once and it is cached
-in the user's own data directory (`~/.local/share/bulk_canvas_actions/config.ini`
-on Linux, equivalents elsewhere):
+personal secret: never paste one into a chat message or commit it, and never
+read or print the key file or `config.ini` (that would put the token in the
+conversation). Pass it once and it is cached, readable only by the user, in
+their data directory (`~/.local/share/bulk_canvas_actions/config.ini` on Linux,
+`~/Library/Application Support/bulk_canvas_actions/` on macOS). Then suggest
+they delete the key file:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/quiz_tool.py" --key-file ~/canvas_key.txt --course-id 12345 quizzes
 ```
 
 Requires Python 3.9+ and `pip install canvasapi`. The Canvas host defaults to
-`https://canvas.jmu.edu`; for another institution edit `canvas_url` in
-`scripts/canvas_config.py`.
+`https://canvas.jmu.edu`; for another institution edit `CANVAS_URL` in
+`scripts/canvas_config.py` (the only place it is set).
 
 ## Facts established by testing (2026-08-28), do not re-derive
 
@@ -168,8 +182,8 @@ Workflow for "change question X":
 
 ## Workflow for "add a question about X to quiz Y"
 
-1. `python quiz_tool.py --course-id N quizzes` to find the quiz id.
-2. `python quiz_tool.py --course-id N questions QUIZ_ID` — **always do this
+1. `python3 quiz_tool.py --course-id N quizzes` to find the quiz id.
+2. `python3 quiz_tool.py --course-id N questions QUIZ_ID` — **always do this
    first.** Match the existing questions' style: they tend to use `<p>` wrapped
    HTML, `<code>`/courier spans for identifiers, and images uploaded to Canvas
    files. Question names are often just `'Question'`.
@@ -210,7 +224,7 @@ quiz_tool.py --course-id N settings QUIZ_ID --due "10/9/2026 17:00" --shuffle
 **Dates are local (America/New_York) and converted to UTC for Canvas.** Accepts
 `M/D/YYYY`, `M/D/YYYY HH:MM` (24-hour), `YYYY-MM-DD[ HH:MM]`, or `none` to
 clear. A bare date means 11:59 PM, which is what a due date almost always
-means. DST is handled. Change `LOCAL_TZ` in quiz_tool.py for another zone.
+means. DST is handled. Change `LOCAL_TZ` in canvas_course.py for another zone.
 
 **`settings` treats dates differently from structure.** Changing `due_at`,
 `unlock_at`, `lock_at`, `title`, `description`, `access_code`,
@@ -221,7 +235,23 @@ thing to do mid-semester. Changing `quiz_type`, `time_limit`,
 `cant_go_back` alters the conditions students were graded under and needs
 `--force`.
 
-Settings changes do not notify students unless you pass `--notify`.
+Notifications, from the canvas-lms source (not yet observed on a real
+student; treat as likely): changing dates or other settings through
+`settings` saves the quiz's assignment without broadcasting, so it should not
+notify students. Publishing does: Canvas announces a newly published quiz as a
+new assignment. Say so in the plan before `--published`.
+
+**Canvas silently ignores some settings**, with no error, unless another
+setting allows them: `scoring_policy` needs `--attempts` above 1,
+`cant_go_back` needs `--one-at-a-time`, and a due date must fall inside the
+unlock/lock window (move `--lock` in the same call). `settings` reads every
+change back, marks one that did not stick with ✗, prints what it needs, and
+exits non-zero. Relay that; do not report the change as made.
+
+**Changing `quiz_type` away from a graded quiz deletes its assignment**
+(the gradebook column, its section overrides, and anything else attached to
+it). Changing back creates a new assignment with a new id. Verified
+2026-11-11. Say this in the plan before changing a quiz's type.
 
 **`find` searches question text and names; add `--answers` to search answer
 text too.** The output says where each match landed (`[match in body]`,
@@ -281,11 +311,26 @@ is invisible to students until then. `question_count` and `points_possible`
 stay stale as well. Verified: a published quiz with 13 added questions
 reported `question_count=0` until republished.
 
-After every change, `resave()` in quiz_tool.py unpublishes and republishes a
-published quiz. If students have submitted, Canvas refuses to unpublish, so
-the tool tells the user to open the quiz and click **Save**. Relay that
-plainly. Until they do, students see the old version. Unpublished quizzes need
-nothing.
+**Do not republish to refresh it unless the user agrees to notifying
+students.** Per the canvas-lms source (not yet observed on a real
+student), republishing through the API makes Canvas treat the quiz's
+assignment as newly published and send students its "new assignment"
+notification (per their notification settings); the API ignores
+`notify_of_update`. So after a change to a published quiz, `resave()` prints
+an instruction instead: open the quiz in Canvas, click Edit, then Save, with
+"Notify users this quiz has changed" unticked. Relay that plainly, and say
+that students see the old version until then. If the user prefers the tool to
+do it and accepts the notification, re-run with `--republish`. If students
+have submitted, Canvas refuses to unpublish, so Save is the only route.
+
+**Unpublished quizzes have stale totals too.** A question added through the
+API leaves the quiz's `points_possible` (and its assignment's, so the
+gradebook shows 0 pts) and `question_count` unchanged. Any save of an
+unpublished quiz recomputes them (canvas-lms `Quiz#set_defaults`), so
+`resave()` re-sends the quiz's own title, which saves it without publishing.
+Verified live 2026-11-11. A quiz created by your own script and
+filled with `post_question()` needs the same: call `resave(quiz)` after the
+last question.
 
 ### File upload questions cannot be tested from Preview
 

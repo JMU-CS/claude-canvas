@@ -9,8 +9,8 @@
     {
       "name": "jmu-canvas",
       "source": "./plugins/jmu-canvas",
-      "description": "Edit Canvas Classic Quiz questions and course structure conversationally, with dry-run/approve/apply/verify for every change. Works around silent-corruption bugs in the Canvas quiz API and blocks access to student data (FERPA).",
-      "version": "2.1.1",
+      "description": "Edit Canvas Classic Quiz questions and course structure conversationally, with dry-run/approve/apply/verify for every change. Works around silent-corruption bugs in the Canvas quiz API and stays away from student data (FERPA), with a hook that blocks the common student-data calls.",
+      "version": "2.2.0",
       "category": "productivity",
       "keywords": ["canvas", "lms", "quizzes", "teaching", "jmu"]
     }

@@ -19,6 +19,7 @@ items behind a separate /api/quiz/v1/ Items API that canvasapi does not wrap.
 import argparse
 import datetime
 import ast
+import decimal
 import hashlib
 import html as html_module
 import json
@@ -32,7 +33,8 @@ import urllib.parse
 from canvas_config import get_canvas_and_course, get_datadir
 
 # Dates on the command line are read and displayed in canvas_course.LOCAL_TZ.
-from canvas_course import CANVAS_URL, LOCAL_TZ, parse_when, show_when  # noqa: E402
+from canvas_course import (CANVAS_URL, LOCAL_TZ, html_signature, parse_when,  # noqa: E402
+                           same, same_html, show_when)  # noqa: E402
 
 # The 12 question types Canvas Classic Quizzes accepts, mapped to how their
 # answers work. Verified against the Canvas API docs for question_type.
@@ -202,11 +204,20 @@ def _log(x, base=10):
     return math.log(x, base)
 
 
+def round_half_away(x, places=0):
+    """Round as Canvas does (Ruby's round: halves away from zero), not as
+    Python's round (halves to even: round(0.125, 2) is 0.12, round(2.5) is 2).
+    A student who rounds 0.125 to 0.13 must match the stored answer."""
+    quantum = decimal.Decimal(1).scaleb(-int(places))
+    value = decimal.Decimal(repr(float(x))).quantize(quantum, decimal.ROUND_HALF_UP)
+    return int(value) if int(places) <= 0 else float(value)
+
+
 FORMULA_FUNCTIONS = {
     "abs": abs, "sqrt": math.sqrt, "ln": math.log, "log": _log, "exp": math.exp,
     "sin": math.sin, "cos": math.cos, "tan": math.tan, "asin": math.asin,
     "acos": math.acos, "atan": math.atan, "ceil": math.ceil,
-    "floor": math.floor, "round": round, "min": min, "max": max,
+    "floor": math.floor, "round": round_half_away, "min": min, "max": max,
     "fact": math.factorial, "comb": math.comb, "perm": math.perm,
 }
 FORMULA_CONSTANTS = {"pi": math.pi, "e": math.e}
@@ -303,6 +314,12 @@ def generate_answer_sets(question, where="question"):
     places = int(question.get("formula_decimal_places") or 0)
     if not formulas or not variables:
         return                     # validate() reports what is missing
+    for v in variables:
+        if (int(v.get("scale") or 0) == 0
+                and math.ceil(float(v["min"])) > math.floor(float(v["max"]))):
+            die(f"{where}: variable '{v['name']}' takes whole numbers (scale 0) "
+                f"but no whole number lies between {v['min']} and {v['max']}; "
+                "widen the range or give it a scale")
     rng = random.Random()
     sets, seen, attempts = [], set(), 0
     while len(sets) < count and attempts < count * 50:
@@ -311,18 +328,20 @@ def generate_answer_sets(question, where="question"):
         for v in variables:
             lo, hi, scale = float(v["min"]), float(v["max"]), int(v.get("scale") or 0)
             env[v["name"]] = (rng.randint(math.ceil(lo), math.floor(hi)) if scale == 0
-                              else round(rng.uniform(lo, hi), scale))
+                              else round_half_away(rng.uniform(lo, hi), scale))
         key = tuple(sorted(env.items()))
         if key in seen:
             continue
         try:
             value = evaluate_formulas(formulas, env)
-        except (ZeroDivisionError, ValueError, OverflowError) as e:
+        except (ZeroDivisionError, ValueError, OverflowError, TypeError) as e:
             if "unsupported" in str(e) or "unknown variable" in str(e):
                 die(f"{where}: {e}")
             continue
+        if isinstance(value, complex):      # e.g. (-x)^0.5: no real answer
+            continue
         seen.add(key)
-        answer = round(float(value), places)
+        answer = round_half_away(value, places)
         sets.append({
             "answer_text": int(answer) if places == 0 else answer,
             "variables": [{"name": v["name"],
@@ -344,6 +363,10 @@ def prepare(question, where="question"):
     for key in READ_ONLY_FIELDS:
         question.pop(key, None)
     question.pop("_fingerprint", None)
+    # canvasapi adds a parsed copy of each date-like attribute as <name>_date
+    # (even course_id_date); older dumps and backups may carry them.
+    for key in [k for k in question if k.endswith("_date")]:
+        question.pop(key)
     if question.get("question_type") == "calculated_question":
         normalize_calculated(question)
         if not question.get("answers") or "answer_count" in question:
@@ -381,6 +404,7 @@ CALCULATED_FIELDS = ("formulas", "variables", "answer_tolerance",
 # position is listed as writable in the API docs but Canvas ignores it.
 READ_ONLY_FIELDS = {
     "id", "quiz_id", "position", "course_id", "assessment_question_id", "name", "matches",
+    "created_at", "updated_at",
 }
 
 # The text fields sent with every edit. Canvas fills any field that is missing
@@ -584,9 +608,16 @@ def validate(question, index):
                                 "but has no answers")
             # An orphaned answer is judged against the whole text, so a blank
             # deliberately placed inside <code> still counts as present.
-            for extra in sorted(in_answers_ids(answers) - blanks_in(text)):
-                problems.append(f"{where}: blank_id '{extra}' has answers but "
-                                f"no [{extra}] in the question text")
+            # Checked literally: Canvas's editor allows ids such as [1] or
+            # [blank-2] (letters, digits, _ - .), which BLANK_RE's stricter
+            # identifier pattern would not see.
+            for extra in sorted(in_answers_ids(answers)):
+                if not re.fullmatch(r"[A-Za-z0-9_\-.]+", str(extra)):
+                    problems.append(f"{where}: blank_id '{extra}' may only use "
+                                    "letters, digits, _ - and .")
+                elif f"[{extra}]" not in (text or ""):
+                    problems.append(f"{where}: blank_id '{extra}' has answers but "
+                                    f"no [{extra}] in the question text")
 
     if style == "blanks":
         # Canvas discards answer HTML for blank/dropdown answers: they render as
@@ -679,6 +710,7 @@ def image_tag(canvas_url, course_id, file_id, alt, width=None):
     """
     base = canvas_url.rstrip("/")
     size = f' width="{width}"' if width else ""
+    alt = html_module.escape(alt or "", quote=True)
     return (f'<img src="{base}/courses/{course_id}/files/{file_id}/preview"'
             f' alt="{alt}"{size} loading="lazy"'
             f' data-api-endpoint="{base}/api/v1/courses/{course_id}/files/{file_id}"'
@@ -832,24 +864,6 @@ def put_question(quiz, question_id, q):
 def post_question(quiz, q):
     return quiz._requester.request("POST", question_path(quiz),
                                    _kwargs=encode_question(q)).json()
-
-
-def html_signature(text):
-    """What matters in a piece of HTML, ignoring how Canvas re-serializes it.
-
-    Canvas sanitizes HTML on save and rewrites file links (adding ?verifier=,
-    dropping the host), so an exact comparison would fail on every image. The
-    visible text plus the image paths is what a stale-content swap changes.
-    """
-    plain = html_module.unescape(re.sub(r"<[^>]+>", " ", text or ""))
-    images = [urllib.parse.urlparse(html_module.unescape(src)).path
-              for src in re.findall(r"<img\b[^>]*?\bsrc=[\"']([^\"']*)",
-                                    text or "", flags=re.I)]
-    return " ".join(plain.split()), images
-
-
-def same_html(a, b):
-    return (a or "") == (b or "") or html_signature(a) == html_signature(b)
 
 
 def plain(value):
@@ -1043,22 +1057,43 @@ def display_order(quiz, questions):
     return rows
 
 
+def warn_hidden_questions(quiz, questions, out=sys.stdout):
+    """Say so when Canvas counts more questions than the API shows: a group
+    drawn from a question bank has no questions the API can see, so Q#
+    labels after it are off by its pick count."""
+    try:
+        expected = expected_question_count(quiz, questions)
+        count = quiz._requester.request(
+            "GET", f"courses/{quiz.course_id}/quizzes/{quiz.id}").json().get("question_count")
+    except Exception:
+        return
+    if count is not None and count > expected:
+        print(f"  !! Canvas counts {count} question(s) on this quiz but the API "
+              f"shows {expected}. A group drawn from a question bank is probably "
+              "hidden from the API, so Q# labels may be off; check them in "
+              "Canvas before quoting them.", file=out)
+
+
 def cmd_questions(course, args):
     quiz = course.get_quiz(args.quiz_id)
     questions = list(quiz.get_questions())
     rows = display_order(quiz, questions)
     taken = has_student_submissions(quiz)
+    # With --json, stdout is only the JSON, so it can be piped to a parser.
+    header = sys.stderr if args.json else sys.stdout
     print(f"{quiz.title}  (id {quiz.id}, {len(questions)} items, "
           f"{getattr(quiz, 'points_possible', '?')} pts, "
           f"{'published' if quiz.published else 'unpublished'}, "
-          f"{'HAS student submissions' if taken else 'no student submissions'})")
-
-    print()
+          f"{'HAS student submissions' if taken else 'no student submissions'})",
+          file=header)
+    print(file=header)
+    warn_hidden_questions(quiz, questions, header)
 
     if args.json:
         payload = []
         for _, q, _ in rows:
-            d = {k: v for k, v in q.__dict__.items() if not k.startswith("_")}
+            d = {k: v for k, v in q.__dict__.items()
+                 if not k.startswith("_") and not k.endswith("_date")}
             # Keep this in an edited dump: `edit` uses it to refuse a write
             # if someone else changed the question in the meantime.
             d["_fingerprint"] = fingerprint(d)
@@ -1112,6 +1147,7 @@ def cmd_add(course, args):
         print("*** DRY RUN: nothing will be created ***")
 
     added = mismatched = 0
+    failed = []
     for i, q in enumerate(questions):
         label = q.get("question_name") or f"{q['question_type']} #{i + 1}"
         if args.dry_run:
@@ -1127,10 +1163,14 @@ def cmd_add(course, args):
         try:
             created = post_question(quiz, q)
         except Exception as e:
-            print(f"  ✗ failed to add {label}: {e}")
+            failed.append(i + 1)
+            print(f"  ✗ failed to add #{i + 1} {label}: {e}")
             continue
         added += 1
-        diffs = differences(q, get_question_raw(quiz, created["id"]))
+        try:
+            diffs = differences(q, get_question_raw(quiz, created["id"]))
+        except Exception as e:
+            diffs = [f"could not read it back: {e}"]
         if diffs:
             mismatched += 1
             print(f"  ✗ added id={created['id']}  {label}, but Canvas stored "
@@ -1141,12 +1181,20 @@ def cmd_add(course, args):
             print(f"  ✓ added id={created['id']}  {label}  (read back, matches)")
 
     if added and not args.dry_run:
-        resave(quiz)
+        resave(quiz, args.republish)
     print(f"\n{added}/{len(questions)} question(s) "
           f"{'would be added' if args.dry_run else 'added'}")
+    problems = []
+    if failed:
+        # Re-running the same file would add the others a second time.
+        problems.append(f"question(s) #{', #'.join(map(str, failed))} in the file "
+                        "were NOT added; the rest were. To retry, send only those, "
+                        "not the whole file")
     if mismatched:
-        die(f"{mismatched} added question(s) do not match what was sent; "
-            "check them in Canvas")
+        problems.append(f"{mismatched} added question(s) do not match what was "
+                        "sent; check them in Canvas")
+    if problems:
+        die("; ".join(problems))
 
 
 def cmd_create(course, args):
@@ -1229,36 +1277,37 @@ def cmd_find(course, args):
             print(f"  (skipped '{quiz.title}': {e})")
             continue
 
-        matches, number = [], 0
-        for q in questions:
-            if q.question_type != "text_only_question":
-                number += 1
+        matches = []
+        # Label with Canvas's own numbering, which counts a group as its
+        # pick_count and skips text-only items (see display_order).
+        for label, q, _ in display_order(quiz, questions):
             scanned += 1
             if args.type and q.question_type != args.type:
                 continue
             body = strip_html(q.question_text)
-            answer_text = " ".join(
-                str(a.get("text") or a.get("left") or "") for a in (q.answers or []))
+            # Each answer separately, so ^ and $ anchor to one answer.
+            answers = [strip_html(str(a.get(k))) for a in (q.answers or [])
+                       for k in ("text", "html", "left", "right")
+                       if a.get(k) not in (None, "")]
             # Track where the match landed so the output can say so honestly.
-            where = None
+            where, source = None, None
             if pattern.search(body):
-                where = "body"
+                where, source = "body", body
             elif pattern.search(q.question_name or ""):
-                where = "name"
-            elif args.answers and pattern.search(answer_text):
-                where = "answers"
+                where, source = "name", q.question_name
+            elif args.answers:
+                source = next((a for a in answers if pattern.search(a)), None)
+                where = "answers" if source is not None else None
             if where:
-                label = f"Q{number}" if q.question_type != "text_only_question" else "--"
-                matches.append((label, q, body, where, answer_text))
+                matches.append((label, q, where, source))
 
         if matches:
             print(f"  {quiz.title}  (quiz {quiz.id}, "
                   f"{'published' if quiz.published else 'unpublished'})")
-            for label, q, body, where, answer_text in matches:
-                print(f"    {label:>4}  id={q.id}  {q.question_type}  "
+            warn_hidden_questions(quiz, questions)
+            for label, q, where, source in matches:
+                print(f"    {label:>5}  id={q.id}  {q.question_type}  "
                       f"{q.points_possible} pt   [match in {where}]")
-                source = {"body": body, "name": q.question_name or "",
-                          "answers": answer_text}[where]
                 m = pattern.search(source)
                 start = max(0, m.start() - 35)
                 snippet = source[start:m.end() + 35]
@@ -1267,6 +1316,27 @@ def cmd_find(course, args):
             print()
 
     print(f"{hits} match(es) across {scanned} question(s).")
+
+
+# Settings Canvas silently drops unless another setting allows them
+# (canvas-lms Api::V1::Quiz#update_api_quiz). Set both in the same call.
+SETTING_NEEDS = {
+    "scoring_policy": "Canvas keeps this only when allowed_attempts is more "
+                      "than 1 (add --attempts N)",
+    "cant_go_back": "Canvas keeps this only with one_question_at_a_time "
+                    "(add --one-at-a-time)",
+    "show_correct_answers": "Canvas ignores this while results are hidden "
+                            "(hide_results is set)",
+    "time_limit": "Canvas ignores a negative time limit",
+    "due_at": "Canvas ignores a due date outside the unlock/lock window; "
+              "move --lock (or --unlock) in the same call",
+    "lock_at": "Canvas ignores a lock date before the due date; move --due "
+               "in the same call",
+    "unlock_at": "Canvas ignores an unlock date after the due date; move "
+                 "--due in the same call",
+    "published": "Canvas will not unpublish a quiz that students have "
+                 "submitted",
+}
 
 
 def cmd_settings(course, args):
@@ -1318,19 +1388,30 @@ def cmd_settings(course, args):
         return
 
     payload = dict(changes)
-    payload["notify_of_update"] = args.notify
     try:
         quiz.edit(quiz=payload)
     except Exception as e:
         die(f"failed to update quiz: {e}")
     after = quiz._requester.request(
         "GET", f"courses/{course.id}/quizzes/{quiz.id}").json()
-    print("  ✓ updated")
-    for field in changes:
+    ignored = []
+    for field, sent in changes.items():
         kind = QUIZ_SETTINGS[field]
         value = after.get(field)
-        print(f"    {field} is now "
+        stuck = (same_html(sent, value) if field == "description"
+                 else same(sent, value))
+        if not stuck:
+            ignored.append(field)
+        print(f"  {'✓' if stuck else '✗'} {field} is now "
               f"{show_when(value) if kind == 'date' else value!r}")
+    if ignored:
+        # Canvas drops these without an error (canvas-lms
+        # Api::V1::Quiz#update_api_quiz).
+        for field in ignored:
+            if field in SETTING_NEEDS:
+                print(f"    {field}: {SETTING_NEEDS[field]}")
+        die(f"Canvas did not apply {', '.join(ignored)}; nothing reported an "
+            "error. See the notes above.")
 
 
 def equation_tag(latex, canvas_url=None):
@@ -1378,11 +1459,23 @@ def cmd_upload_image(course, args):
         print(image_tag(CANVAS_URL, course.id, "<FILE_ID>", alt, width))
         return
 
-    ok, response = course.upload(str(path), parent_folder_path=args.folder)
+    # Canvas's default for a name already in the folder is to overwrite it,
+    # which also re-points links to the old file at the new one: every earlier
+    # question using a same-named image would silently show this one instead.
+    ok, response = course.upload(str(path), parent_folder_path=args.folder,
+                                 on_duplicate="rename")
     if not ok:
         die(f"upload failed: {response}")
     file_id = response["id"]
     print(f"  ✓ uploaded as file {file_id} ({response['display_name']})")
+    # Hidden: reachable through the link in the question, but not listed in
+    # Files, so students cannot browse quiz images before the quiz opens.
+    try:
+        course.get_file(file_id).update(hidden=True)
+        print("  ✓ hidden from the Files list (the link in a question still works)")
+    except Exception as e:
+        print(f"  !! could not hide the file ({e}); students may be able to "
+              "find it under Files")
     print("\nPaste this into a question's question_text:\n")
     print(image_tag(CANVAS_URL, course.id, file_id, alt, width))
 
@@ -1416,6 +1509,11 @@ def cmd_edit(course, args):
     for field in COMMENT_FIELDS:
         if field in changes and f"{field}_html" not in changes:
             merged[f"{field}_html"] = ""
+    if ("quiz_group_id" in changes and not changes["quiz_group_id"]
+            and live.get("quiz_group_id")):
+        die("Canvas ignores a cleared quiz_group_id on an edit, so the question "
+            "would stay in its group. To take it out, list its id on its own "
+            "in `reorder --order`.")
     merged.update({k: v for k, v in changes.items() if k != "_fingerprint"})
     # A formula question's answer sets were computed from its formula and
     # variable ranges; if those change, the old sets are wrong. Regenerate
@@ -1459,7 +1557,11 @@ def cmd_edit(course, args):
     changed = [f for f in sorted(set(base) | set(merged))
                if base.get(f) != merged.get(f)]
     if not changed:
-        print("  no field changes; the full question will be rewritten as-is")
+        # base and merged are compared exactly, so this means the write would
+        # store what Canvas already has. Skip it, and the republish of a
+        # published quiz that would follow.
+        print("  already as requested; nothing was sent")
+        return
     for field in changed:
         before, after = base.get(field), merged.get(field)
         if field == "answers":
@@ -1504,7 +1606,7 @@ def cmd_edit(course, args):
             f"web UI now. The previous version is saved at {backup}")
     print(f"  ✓ updated and read back: matches (fingerprint {fingerprint(after)})")
     print(f"  previous version saved to {backup}")
-    resave(quiz)
+    resave(quiz, args.republish)
 
 
 def post_json(quiz, path, body):
@@ -1565,14 +1667,24 @@ def cmd_reorder(course, args):
     current = [e["token"] for e in entries]
     labels = {e["token"]: e["label"] for e in entries}
 
+    # A question inside a group may also be listed on its own: Canvas's
+    # quiz-level reorder sets every question it lists to "no group"
+    # (Quizzes::QuizSortables#reorder!), so that takes it out of its group.
+    # This is the only API route for that; an edit ignores a cleared group id.
+    leaving = {}
+    for e in entries:
+        for q in e.get("members") or []:
+            leaving[str(q.id)] = e["group"].get("name")
+            labels.setdefault(str(q.id), f"{q.question_type}  {q.question_name!r}  "
+                                         f"{summarize(q)[:50]}")
+
     wanted = [t.strip() for t in args.order.replace(" ", ",").split(",") if t.strip()]
     missing = [t for t in current if t not in wanted]
     unknown = [t for t in wanted if t not in labels]
     dupes = sorted({t for t in wanted if wanted.count(t) > 1})
     if unknown or missing or dupes:
         for t in unknown:
-            print(f"error: {t} is not a top-level question or group on this quiz "
-                  "(questions inside a group move with the group; give g<ID>)",
+            print(f"error: {t} is not a question or group on this quiz",
                   file=sys.stderr)
         for t in missing:
             print(f"error: {t} ({labels[t]}) is missing from --order", file=sys.stderr)
@@ -1587,6 +1699,10 @@ def cmd_reorder(course, args):
     print(f"Reordering '{quiz.title}' (quiz {quiz.id})")
     print(f"  {'now':>4}  {'new':>4}  id")
     for new_pos, token in enumerate(wanted, 1):
+        if token in leaving:
+            print(f"  {'-':>4}  {new_pos:>4}  {token:>10}  {labels[token]}  "
+                  f"<- LEAVES group {leaving[token]!r}")
+            continue
         old_pos = current.index(token) + 1
         mark = "" if old_pos == new_pos else "  <-"
         print(f"  {old_pos:>4}  {new_pos:>4}  {token:>10}  {labels[token]}{mark}")
@@ -1616,7 +1732,7 @@ def cmd_reorder(course, args):
         die("Canvas reports a different order than requested:\n  "
             + " ".join(after) + "\nCheck the quiz in the web UI.")
     print("  ✓ reordered and read back: matches")
-    resave(quiz)
+    resave(quiz, args.republish)
 
 
 def cmd_delete(course, args):
@@ -1635,9 +1751,11 @@ def cmd_delete(course, args):
         if input("Proceed? (yes/no): ").strip().lower() != "yes":
             print("Cancelled.")
             return
+    backup = backup_question(get_question_raw(quiz, question.id))
     question.delete()
     print("  ✓ deleted")
-    resave(quiz)
+    print(f"  saved to {backup}; restore it with: add {quiz.id} --file {backup}")
+    resave(quiz, args.republish)
 
 
 def settle(fetch, expected, attempts=4, delay=0.5):
@@ -1656,7 +1774,25 @@ def settle(fetch, expected, attempts=4, delay=0.5):
     return result
 
 
-def resave(quiz):
+def expected_question_count(quiz, questions):
+    """The question_count Canvas should report (canvas-lms Quiz#question_count).
+
+    A loose question counts 1 unless it is text-only; a group counts its
+    pick_count, however many questions it holds. A group drawn from a
+    question bank has no questions the API can see, so it is not counted.
+    """
+    count, groups = 0, set()
+    for q in questions:
+        gid = getattr(q, "quiz_group_id", None)
+        if gid:
+            groups.add(gid)
+        elif q.question_type != "text_only_question":
+            count += 1
+    return count + sum(quiz_group(quiz, gid).get("pick_count") or 0
+                       for gid in groups)
+
+
+def resave(quiz, republish=False):
     """Make a published quiz serve its current questions.
 
     A published quiz serves a frozen snapshot (quiz_data) that Canvas
@@ -1664,43 +1800,87 @@ def resave(quiz):
     quiz is saved in the web UI (canvas-lms Quiz#generate_quiz_data_on_publish
     and QuizzesController#update). Any question change made through the API --
     edit, add, delete, reorder -- is invisible to students until then, and
-    question_count / points_possible stay stale. So after a change to a
-    published quiz, unpublish and republish it.
+    question_count / points_possible stay stale.
 
-    Canvas refuses to unpublish a quiz once students have submitted (including
-    attempts in progress); then the user must open the quiz in Canvas and click
-    Save. On an UNPUBLISHED quiz nothing is being served, so nothing is needed.
+    The web UI's Save regenerates it without changing the published state,
+    and notifies students only if "Notify users this quiz has changed" is
+    ticked. The API has no equivalent. Unpublishing and republishing through
+    the API regenerates it too, but republishing marks the quiz's assignment
+    as newly published, and Canvas then sends students its "assignment
+    created" notification: Quiz#update_assignment sets notify_of_update from
+    the publish transition, and the API does not accept notify_of_update
+    (it is not in Api::V1::Quiz's allowed fields). So by default this tells
+    the user to click Save, and only toggles with republish=True, which the
+    user must choose knowing students may be notified. Canvas refuses to
+    unpublish a quiz once students have submitted; then Save is the only way.
+
+    An UNPUBLISHED quiz serves nothing, but its points_possible and
+    question_count are still stale, and so is its assignment's points (the
+    gradebook shows 0). Any save of an unpublished quiz recomputes both
+    (canvas-lms Quiz#set_defaults) and copies the points to the assignment
+    (Quiz#update_assignment), and the API's update always saves
+    (Api::V1::Quiz#update_api_quiz). So re-send its own title. That changes
+    nothing else, and does not publish it.
     """
     try:
         def totals():
             r = quiz._requester.request(
                 "GET", f"courses/{quiz.course_id}/quizzes/{quiz.id}").json()
-            return r.get("question_count"), r.get("points_possible"), r.get("published")
+            return (r.get("question_count"), r.get("points_possible"),
+                    r.get("published"), r.get("title"))
 
         questions = list(quiz.get_questions())
-        # Canvas's question_count excludes text-only items.
-        graded = sum(1 for q in questions
-                     if q.question_type != "text_only_question")
-        count, points, published = totals()
+        graded = expected_question_count(quiz, questions)
+        count, points, published, title = totals()
         if not published:
-            print(f"  quiz now has {len(questions)} item(s); unpublished, so "
-                  "students will see these questions once it is published")
+            quiz.edit(quiz={"title": title})
+            count, points, *_ = settle(totals, graded)
+            print(f"  quiz now has {len(questions)} item(s), {points} pts; "
+                  "unpublished, so students will see these questions once it "
+                  "is published")
+            if count != graded:
+                print(f"  !! Canvas reports {count} question(s); expected "
+                      f"{graded}. Unless the quiz has a group drawn from a "
+                      "question bank (invisible to the API), open it in "
+                      "Canvas and click Save to update its totals.")
             return
+        save_in_canvas = (
+            "Students keep seeing the PREVIOUS version of this quiz's questions "
+            "(and its old point total) until you open the quiz in Canvas, click "
+            "Edit, then Save. Leave \"Notify users this quiz has changed\" "
+            "unticked to avoid notifying students.")
         if has_student_submissions(quiz):
             print("  !! This quiz is published and students have submitted, so "
-                  "Canvas will not let it be unpublished. Students still see the "
-                  "PREVIOUS version of the questions until you open the quiz in "
-                  "Canvas and click Save.")
+                  "it cannot be republished. " + save_in_canvas)
+            return
+        if not republish:
+            print("  !! This quiz is published. " + save_in_canvas + " (Or re-run "
+                  "with --republish to unpublish and republish it through the "
+                  "API; Canvas may then notify students of it as a new "
+                  "assignment.)")
             return
         quiz.edit(quiz={"published": False})
-        quiz.edit(quiz={"published": True, "notify_of_update": False})
-        count, points, published = settle(totals, graded)
-        print(f"  republished so students see the change; quiz now has "
-              f"{len(questions)} item(s), {points} pts")
+        # From here the quiz is hidden from students; never leave it that way.
+        error = "it still reads as unpublished"
+        for attempt in range(3):
+            try:
+                quiz.edit(quiz={"published": True})
+            except Exception as e:
+                error = e
+            if totals()[2]:
+                break
+            time.sleep(1)
+        else:
+            die(f"the quiz was UNPUBLISHED to refresh it and republishing it "
+                f"failed ({error}). Students cannot see it. Publish it in "
+                f"Canvas now: {CANVAS_URL}/courses/{quiz.course_id}/quizzes/{quiz.id}")
+        count, points, *_ = settle(totals, graded)
+        print(f"  republished so students see the change (Canvas may notify "
+              f"them); quiz now has {len(questions)} item(s), {points} pts")
     except Exception as e:
-        print(f"  !! could not republish ({e}). If the quiz is published, open "
-              "it in Canvas and click Save, or students keep seeing the old "
-              "version.")
+        print(f"  !! could not update the quiz's totals ({e}). Open it in "
+              "Canvas and click Save; if it is published, students keep "
+              "seeing the old version until then.")
 
 
 def main():
@@ -1801,8 +1981,6 @@ def main():
                        help=helptext)
         g.add_argument(f"--no-{flag}", dest=dest, action="store_false", default=None,
                        help=f"turn off: {helptext}")
-    p.add_argument("--notify", action="store_true",
-                   help="notify students of the change (default: do not)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--force", action="store_true",
                    help="allow risky changes on a quiz with submissions")
@@ -1847,6 +2025,11 @@ def main():
                         help="show what would change without sending it to Canvas")
         sp.add_argument("--force", action="store_true",
                         help="allow editing a quiz that already has submissions")
+        sp.add_argument("--republish", action="store_true",
+                        help="if the quiz is published, unpublish and republish "
+                             "it so students see the change now. Canvas may "
+                             "notify students. Without this, the tool says to "
+                             "click Save in Canvas instead.")
 
     canvas, course, args = get_canvas_and_course(parser)
     args.func(course, args)

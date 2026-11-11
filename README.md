@@ -28,11 +28,17 @@ Claude is not approved to handle student education records, so neither skill
 reads submissions, scores, grades, rosters, enrollments, user records,
 analytics, messages, or discussion replies. The skills instruct Claude to stop
 and hand such tasks back to you. A `PreToolUse` hook
-(`plugins/jmu-canvas/hooks/ferpa_guard.py`) also blocks shell commands, and the
-scripts they run, that call those Canvas endpoints. It is a backstop, not a
-guarantee. It applies to every Claude Code session where the plugin is
-enabled, so Claude also cannot run your own grade or submission scripts. Run
-those yourself.
+(`plugins/jmu-canvas/hooks/ferpa_guard.py`) also blocks shell commands that
+call those Canvas endpoints (including the scripts they run and the local
+modules those import), and web fetches or browser navigation to Canvas pages
+that show student data, such as the gradebook, SpeedGrader and People.
+
+The hook is a backstop, not a guarantee. It reads text, so it misses code that
+builds an endpoint name at run time or hides the call more than one import
+deep, clicks inside a Canvas page the browser already has open, and exported
+files read directly. It applies to every Claude Code session where the plugin
+is enabled, so Claude also cannot run your own grade or submission scripts.
+Run those yourself.
 
 ## Requirements
 
@@ -44,8 +50,8 @@ those yourself.
   script against Canvas's separate New Quizzes API, but that route is untested.
 
 The Canvas host defaults to `https://canvas.jmu.edu` and dates to
-`America/New_York` (`CANVAS_URL` and `LOCAL_TZ` in
-`plugins/jmu-canvas/scripts/canvas_course.py`).
+`America/New_York`: `CANVAS_URL` in `plugins/jmu-canvas/scripts/canvas_config.py`
+and `LOCAL_TZ` in `plugins/jmu-canvas/scripts/canvas_course.py`.
 
 ## Install
 
@@ -96,19 +102,27 @@ Use the **Marketplaces** tab of `/plugins`, or
 ## First run
 
 Once a Canvas administrator has issued your token, keep it secret: don't paste
-it into a chat and don't commit it. Put it in a file and pass it once; it is
-cached in your own user data directory afterwards.
+it into a chat and don't commit it. Save it in a file with a text editor (an
+`echo` command would leave it in your shell history), make the file private,
+and pass it once:
 
 ```
-echo 'YOUR_TOKEN' > ~/canvas_key.txt && chmod 600 ~/canvas_key.txt
+chmod 600 ~/canvas_key.txt
+python3 <scripts>/quiz_tool.py --key-file ~/canvas_key.txt --course-id 12345 quizzes
+rm ~/canvas_key.txt
 ```
 
-Then just ask, and Claude runs the tool for you.
+The token is then cached, readable only by you, in
+`~/.local/share/bulk_canvas_actions/config.ini` (macOS:
+`~/Library/Application Support/bulk_canvas_actions/`), so the key file can be
+deleted. After that, just ask, and Claude runs the tool for you.
 
 ## Using the tools directly
 
-The scripts live in `plugins/jmu-canvas/scripts/`. Claude runs them for you,
-but they work from a terminal too.
+The scripts live in `plugins/jmu-canvas/scripts/` in this repository, or, for
+a marketplace install, in
+`~/.claude/plugins/cache/jmu-cs/jmu-canvas/<version>/scripts/`. Claude runs
+them for you, but they work from a terminal too.
 
 ```
 # browse
@@ -128,7 +142,7 @@ quiz_tool.py --course-id 12345 settings 67890
 quiz_tool.py --course-id 12345 settings 67890 --due "10/9/2026 17:00" --shuffle
 ```
 
-Dates are local (`America/New_York`, set by `LOCAL_TZ` in the script). Accepts
+Dates are local (`America/New_York`, set by `LOCAL_TZ` in canvas_course.py). Accepts
 `M/D/YYYY`, `M/D/YYYY HH:MM` 24-hour, `YYYY-MM-DD`, or `none` to clear. A bare
 date means 11:59 PM.
 
@@ -145,12 +159,17 @@ Run `quiz_tool.py <subcommand> --help` for the full options.
   `~/.local/share/bulk_canvas_actions/quiz_backups/`.
 - `settings` is more permissive: date and title changes on a live quiz warn and
   proceed, while changes to time limit, attempts, quiz type, or scoring policy
-  need `--force`. Nothing notifies students unless you pass `--notify`.
+  need `--force`. Judging by the Canvas source, date and settings changes
+  made this way don't notify students, while publishing a quiz does (Canvas
+  announces it as a new assignment). This hasn't yet been confirmed with a
+  real student account.
 - Every mutating subcommand takes `--dry-run`.
 - Questions are validated before anything is sent to Canvas.
-- After any change to a published quiz, the tool republishes it so students
-  see the change. If students have already submitted, Canvas won't allow
-  that, and the tool asks you to click **Save** on the quiz in Canvas instead.
+- After any change to a published quiz, students keep seeing the old version
+  until the quiz is saved in Canvas. The tool tells you to open the quiz,
+  click **Edit**, then **Save**. It can republish the quiz for you instead
+  (`--republish`), but Canvas may then notify students of it as a new
+  assignment.
 - A question group that draws from a question bank is invisible to the API.
   If a quiz has one, check its place in Canvas after a `reorder`.
 
@@ -174,8 +193,13 @@ Offline tests, no Canvas access needed:
 
 ```
 python3 tests/test_quiz_tool.py      # quiz_tool against a fake Canvas
+python3 tests/test_canvas_course.py  # dates, plan display, apply guards
 python3 tests/test_ferpa_guard.py    # what the hook blocks and allows
+python3 tests/mutation_check.py      # do the tests catch deliberate breaks?
 ```
+
+`tests/live_test_plan.md` lists scenarios to run against a sandbox course
+after changes to either skill, with the results of the last run.
 
 The fake Canvas mirrors the behaviour of the canvas-lms source
 (`AssessmentQuestion.parse_question` and the per-type answer parsers). Changes

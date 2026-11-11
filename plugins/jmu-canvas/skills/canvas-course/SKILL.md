@@ -16,7 +16,10 @@ for what the user wants, look for a route that gets the same result: a
 sequence of calls, copying and then removing, or re-creating an object.
 Present it as a plan the usual way. Users care about the outcome, not about
 whether one endpoint does it. Say something is impossible only after ruling
-out the workarounds, and then say what the user can do instead.
+out the workarounds, and then say what the user can do instead. Deleting and
+re-creating something students have used (an assignment, quiz, or discussion
+with submissions or replies) is not a workaround: it loses that work, its
+grades and its links. Say exactly what would be lost before offering it.
 
 ## Student data is off limits (FERPA)
 
@@ -43,9 +46,16 @@ tool:
 - Assignment overrides can name individual students (`student_ids`). Work
   with section overrides (`course_section_id`) only, and never print
   `student_ids`.
-- A plugin hook blocks commands that call the common student-data endpoints.
-  It is a backstop. If it fires, the task needs rethinking; do not rephrase
-  the command to get past it.
+- **No browser or web tools on Canvas pages that show students:** the
+  gradebook, SpeedGrader, People, quiz statistics or moderation, discussion
+  threads, Inbox, or any student's page. The instructor's browser is logged in
+  as them, so these pages carry the same records the API does. Use the API for
+  course structure instead.
+- A plugin hook blocks commands that call the common student-data endpoints,
+  and web fetches or browser navigation to those pages. It is a backstop. If
+  it fires, the task needs rethinking; do not rephrase the command to get past
+  it. If it fires on something that plainly touches no student data, tell the
+  user what it matched rather than working around it.
 
 ## Setup
 
@@ -88,26 +98,41 @@ id; check it is the course the user meant before going further.
    path. Do not paraphrase a partial result as success.
 
 ```python
-from canvas_course import connect, ChangeSet, parse_when, shift
+from canvas_course import connect, ChangeSet, shift_window, window
 
 course = connect()
 plan = ChangeSet(course, "Week 3 due dates back two days")
 for a in course.get_assignments():
     if a.name.startswith("W3") and a.due_at:
-        new = shift(a.due_at, days=2)          # keeps local wall-clock time
-        plan.add(f"assignment {a.id} '{a.name}'", "due_at", a.due_at, new,
-                 apply=lambda a=a, new=new: a.edit(assignment={"due_at": new}),
-                 check=lambda a=a: course.get_assignment(a.id).due_at)
+        new = shift_window(a, days=2)   # unlock, due and lock together
+        plan.add(f"assignment {a.id} '{a.name}'", "dates", window(a), new,
+                 apply=lambda a=a, new=new: a.edit(assignment=new),
+                 check=lambda a=a: window(course.get_assignment(a.id)))
 plan.run()
 ```
 
 Bind loop variables as lambda defaults (`a=a`) as shown, or every callable
 acts on the last item. Use `field="create"` / `field="delete"` for creating
-or removing objects (put a readable description in `after` / `target`).
+or removing objects:
+
+- **Create:** put a readable description in `after`, including whether the
+  object will be published. Make `apply` *return* the new object
+  (`apply=lambda: course.create_page(...)`). The journal then records its id,
+  which is what makes the create undoable. A create that an earlier apply
+  already made (same target and `after`) is refused, so a retried or
+  re-run plan cannot make duplicates. After a partial failure, drop the
+  creates the dry run reports as already made and apply the rest. Pass
+  `repeat_ok=True` only when the user wants another copy.
+- **Delete:** put the full object as `before` (for a page, its title, body
+  and settings), so it can be re-created from the journal. Canvas also keeps
+  deleted pages, assignments and quizzes restorable for a while at
+  `/courses/N/undelete`.
 
 Every apply writes a journal of previous values to
-`~/.local/share/bulk_canvas_actions/change_log/`. To undo, build a new plan
-from the journal's `before` values and run it the same way.
+`~/.local/share/bulk_canvas_actions/change_log/` (macOS:
+`~/Library/Application Support/bulk_canvas_actions/change_log/`). To undo,
+build a new plan from the journal's `before` values (and `created` ids, for
+creates) and run it the same way.
 
 ## Rules
 
@@ -116,6 +141,10 @@ from the journal's `before` values and run it the same way.
 - **Deleting needs extra care.** List every item by name and id in the dry
   run. Prefer unpublishing over deleting when the user's intent allows. Never
   delete files or pages that other content may link to without saying so.
+- **Deleting an assignment group deletes every assignment in it**, with no
+  warning from Canvas (verified 2026-11-11). Unless the user explicitly wants
+  those assignments gone, pass `group.delete(move_assignments_to=OTHER_ID)`,
+  and list the assignments that move (or that would be deleted) in the plan.
 - **Do not publish, and do not notify students, unless asked.** New content
   should be created unpublished unless the user says otherwise. Posting an
   announcement or sending notifications reaches students immediately and
@@ -125,9 +154,10 @@ from the journal's `before` values and run it the same way.
   `has_submitted_submissions` before changing points, submission types, or
   grading settings, and tell the user if it is set. Moving dates is normal;
   changing how work is graded is not.
-- **Try unfamiliar operations on a sandbox first**: an unpublished course
-  with no real students. Ask the user which course to use if you do not know,
-  and mention the sandbox run when you present the plan.
+- **Untested operations go to a sandbox first.** If nothing in this skill
+  covers an operation, suggest trying it on a sandbox course (no real
+  students) before the real one, and ask the user which course to use. The
+  sandbox run is a change like any other: dry run, the user's yes, apply.
 - Stay inside what was asked. A request to "set up modules" is not license
   to rename assignments or change dates you noticed along the way. Suggest
   those separately.
@@ -137,19 +167,45 @@ from the journal's `before` values and run it the same way.
 - **Dates are UTC in the API.** Use `parse_when()` for user input and
   `shift()` to move existing dates. `shift()` works in local time, so a change
   across a DST boundary keeps 11:59 PM. Display with `show_when()`.
-- **`due_at` on an assignment is the "Everyone" date.** If `has_overrides` is
-  true, sections may have their own dates, and changing `due_at` leaves those
-  alone. Say so in the plan.
-- **Classic quiz dates live on the quiz.** Change them with
-  `quiz_tool.py settings` (which does not notify students), not through the
-  quiz's assignment.
+- **Move a due date with its window.** Canvas rejects an assignment due date
+  outside its unlock/lock dates ("must be between availability dates"), and
+  the quiz API silently ignores one. When moving dates, use `shift_window()`
+  to move unlock, due and lock together, and `window()` for the before value
+  and the check, so the plan shows all of them and the journal keeps raw dates. If the user asked to move only the due date and that would put it
+  outside the window, say so in the plan rather than letting the apply fail.
+- **`due_at` on an assignment is the "Everyone" date, but only when read
+  through `connect()`'s course.** Canvas's default read applies overrides for
+  the requesting user, so a raw API read, or an assignment reached any other
+  way (for example through a quiz's assignment from a different Canvas
+  object), can return a section's date instead. `connect()` makes
+  `course.get_assignment(s)` pass `override_assignment_dates=False`; read
+  assignments through it. If `has_overrides` is true (`inventory assignments`
+  marks these), sections have their own dates, and changing `due_at` leaves
+  them alone. Say so in the plan, and move overrides too if the user means
+  "everyone".
+- **Classic quiz dates can be moved either way.** `course.get_assignments()`
+  includes each quiz's assignment, and dates set on it carry over to the quiz
+  (verified 2026-11-11), so one date plan can cover quizzes and assignments.
+  For a single quiz, `quiz_tool.py settings` is simpler. Either way, move the
+  whole window (`shift_window`). **Notifications** (from the canvas-lms
+  source, not yet observed on a real student; treat them as likely): moving
+  the due date of a *published* assignment through the assignment API sends
+  students "Assignment Due Date Changed" (`BroadcastPolicies::AssignmentPolicy`);
+  the same move through the quiz API (`quiz.edit` or `quiz_tool.py settings`)
+  saves without broadcasting. Publishing an assignment or quiz sends "new
+  assignment". Say which applies in the plan.
 - **Moving a module item:**
   `item.edit(module_item={"module_id": dest.id, "position": n, "indent": k})`,
   Positions are 1-based.
-- **Module and item publish states are separate.** Do not assume publishing
-  or unpublishing a module through the API changes its items (unverified;
-  set both explicitly).
-  Plan item changes explicitly and read both back.
+- **Publishing or unpublishing a module cascades to everything in it**
+  (verified 2026-11-11). `module.edit(module={"published": ...})` sets every
+  item in the module *and the content it points at* (pages, assignments,
+  quizzes) to the same state. Unpublishing a module therefore hides content
+  that was already published, such as a quiz students are about to take. In
+  the plan, list each item that will change state, by name, as its own line.
+  To publish a module but keep some items hidden, unpublish those items
+  afterwards, in the same plan. Adding published content to an unpublished
+  module does not change the content's state.
 - **Module items point at content.** Deleting an item removes it from the
   module only; deleting the page, assignment, or file it points at is a
   separate and more destructive change.
